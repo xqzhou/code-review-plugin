@@ -9,11 +9,11 @@ import com.codereview.service.MrReviewService
 import com.codereview.ui.CommentToolWindowService
 import com.codereview.util.ProjectFiles
 import com.intellij.icons.AllIcons
-import com.intellij.codeInsight.navigation.actions.GotoDeclarationAction
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffRequestPanel
 import com.intellij.diff.tools.util.DiffDataKeys
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
+import com.intellij.diff.util.Side
 import com.intellij.ide.DataManager
 import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.actionSystem.IdeActions
@@ -32,16 +32,17 @@ import com.intellij.openapi.editor.markup.HighlighterLayer
 import com.intellij.openapi.editor.markup.HighlighterTargetArea
 import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.fileEditor.FileEditor
-import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.FileEditorState
 import com.intellij.openapi.fileEditor.FileEditorStateLevel
-import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.IconLoader
 import com.intellij.openapi.util.Key
 import com.intellij.openapi.util.UserDataHolderBase
 import com.intellij.psi.PsiDocumentManager
+import com.intellij.psi.PsiElement
+import com.intellij.psi.PsiManager
+import com.intellij.psi.PsiPolyVariantReference
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SearchTextField
@@ -71,7 +72,6 @@ import javax.swing.tree.TreePath
 import kotlin.math.max
 import java.awt.event.MouseEvent
 import com.intellij.openapi.keymap.KeymapUtil
-import com.intellij.util.PsiNavigateUtil
 
 class MrReviewFileEditor(
     private val project: Project,
@@ -183,10 +183,15 @@ class MrReviewFileEditor(
             add(metaLabel)
         }
 
+        val headerActions = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(10), 0)).apply {
+            isOpaque = false
+            add(toggleFilesLink)
+        }
+
         val header = JPanel(BorderLayout()).apply {
             border = JBUI.Borders.empty(10, 12)
             add(headerInfo, BorderLayout.WEST)
-            add(toggleFilesLink, BorderLayout.EAST)
+            add(headerActions, BorderLayout.EAST)
         }
 
         root.add(header, BorderLayout.NORTH)
@@ -202,7 +207,7 @@ class MrReviewFileEditor(
         changesTree.addTreeSelectionListener {
             if (applyingSelection) return@addTreeSelectionListener
             val entry = selectedTreeEntry() as? TreeEntry.File ?: return@addTreeSelectionListener
-            showChange(entry.index, null)
+            showChange(entry.index, null, Side.RIGHT)
         }
 
         val connection = project.messageBus.connect(this)
@@ -210,7 +215,7 @@ class MrReviewFileEditor(
             override fun onReviewSessionChanged(session: MrReviewSession?, navigation: MrReviewService.ReviewNavigation?) {
                 if (session != null && session.sessionKey == this@MrReviewFileEditor.session?.sessionKey) {
                     if (navigation != null) {
-                        selectChange(navigation.changeIndex, navigation.line)
+                        selectChange(navigation.changeIndex, navigation.line, navigation.side)
                     } else {
                         refreshDiffDecorations()
                     }
@@ -239,7 +244,7 @@ class MrReviewFileEditor(
 
     override fun setState(state: FileEditorState) {
         if (state is State && state.selectedChangeIndex >= 0) {
-            selectChange(state.selectedChangeIndex, null)
+            selectChange(state.selectedChangeIndex, null, Side.RIGHT)
         }
     }
 
@@ -276,7 +281,7 @@ class MrReviewFileEditor(
             ?: firstVisibleChangeIndex()
             ?: -1
         if (targetIndex >= 0) {
-            selectChange(targetIndex, navigation?.line)
+            selectChange(targetIndex, navigation?.line, navigation?.side ?: Side.RIGHT)
         } else {
             selectedChangeIndex = -1
             clearDiffPanel()
@@ -357,10 +362,10 @@ class MrReviewFileEditor(
         return null
     }
 
-    private fun selectChange(index: Int, line: Int?) {
+    private fun selectChange(index: Int, line: Int?, side: Side) {
         if (findTreePath(index) == null) return
         selectTreeNode(index)
-        showChange(index, line)
+        showChange(index, line, side)
     }
 
     private fun selectTreeNode(index: Int) {
@@ -394,8 +399,8 @@ class MrReviewFileEditor(
         return node.userObject as? TreeEntry
     }
 
-    private fun showChange(index: Int, line: Int?) {
-        val request = service.createRequest(index, line) ?: return
+    private fun showChange(index: Int, line: Int?, side: Side) {
+        val request = service.createRequest(index, line, side) ?: return
         selectedChangeIndex = index
         diffContainer.removeAll()
         diffContainer.add(requestPanel.component, BorderLayout.CENTER)
@@ -570,25 +575,54 @@ class MrReviewFileEditor(
 
     private fun navigateFromDiffOffset(editor: EditorEx?, line: Int, column: Int): Boolean {
         val change = currentChange() ?: return false
-        val referent = ProjectFiles.find(project, change.newPath ?: change.oldPath ?: return false) ?: return false
-        val actualEditor = FileEditorManager.getInstance(project)
-            .openTextEditor(OpenFileDescriptor(project, referent, line.coerceAtLeast(0), column.coerceAtLeast(0)).setUsePreviewTab(true), false)
-            ?: return false
-
+        val contextFile = ProjectFiles.find(project, change.newPath ?: change.oldPath ?: return false) ?: return false
+        val psiFile = PsiManager.getInstance(project).findFile(contextFile) ?: return false
+        val document = PsiDocumentManager.getInstance(project).getDocument(psiFile) ?: return false
         PsiDocumentManager.getInstance(project).commitAllDocuments()
 
-        val safeLine = line.coerceIn(0, actualEditor.document.lineCount - 1)
-        val lineStart = actualEditor.document.getLineStartOffset(safeLine)
-        val lineEnd = actualEditor.document.getLineEndOffset(safeLine)
+        val safeLine = line.coerceIn(0, document.lineCount - 1)
+        val lineStart = document.getLineStartOffset(safeLine)
+        val lineEnd = document.getLineEndOffset(safeLine)
         val targetOffset = (lineStart + column).coerceIn(lineStart, lineEnd)
+        val target = resolveNavigationTarget(psiFile, targetOffset) ?: return false
+        val targetPsiFile = target.containingFile ?: return false
+        val targetFile = targetPsiFile.virtualFile ?: return false
+        val targetDocument = PsiDocumentManager.getInstance(project).getDocument(targetPsiFile) ?: return false
+        val targetLine = targetDocument.getLineNumber(target.textOffset.coerceAtLeast(0)) + 1
+        return service.navigateToFileDiff(targetFile, targetLine)
+    }
 
-        val targets = GotoDeclarationAction.findAllTargetElements(project, actualEditor, targetOffset)
-        if (targets.isEmpty()) {
-            return false
+    private fun resolveNavigationTarget(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {
+        val maxOffset = psiFile.textLength.coerceAtLeast(1) - 1
+        val offsets = buildList {
+            add(offset.coerceIn(0, maxOffset))
+            if (offset > 0) add((offset - 1).coerceIn(0, maxOffset))
+        }.distinct()
+
+        offsets.forEach { candidateOffset ->
+            resolveReferenceTarget(psiFile, candidateOffset)?.let { return it }
+            val element = psiFile.findElementAt(candidateOffset) ?: return@forEach
+            resolveElementTarget(element)?.let { return it }
         }
+        return null
+    }
 
-        PsiNavigateUtil.navigate(targets.first(), true)
-        return true
+    private fun resolveReferenceTarget(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {
+        val reference = psiFile.findReferenceAt(offset) ?: return null
+        return when (reference) {
+            is PsiPolyVariantReference -> reference.multiResolve(false).firstOrNull()?.element
+            else -> reference.resolve()
+        }
+    }
+
+    private fun resolveElementTarget(element: PsiElement): PsiElement? {
+        element.reference?.resolve()?.let { return it }
+        var current: PsiElement? = element.parent
+        while (current != null) {
+            current.reference?.resolve()?.let { return it }
+            current = current.parent
+        }
+        return null
     }
 
     private fun matchesFilter(change: MrReviewChange, query: String): Boolean {

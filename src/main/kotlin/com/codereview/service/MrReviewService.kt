@@ -45,7 +45,7 @@ class MrReviewService(private val project: Project) {
         fun onReviewSessionChanged(session: MrReviewSession?, navigation: ReviewNavigation?)
     }
 
-    data class ReviewNavigation(val changeIndex: Int, val line: Int? = null)
+    data class ReviewNavigation(val changeIndex: Int, val line: Int? = null, val side: Side = Side.RIGHT)
 
     private val store = CommentStore(project)
 
@@ -77,10 +77,27 @@ class MrReviewService(private val project: Project) {
 
     fun currentNavigation(): ReviewNavigation? = currentNavigation
 
-    fun createRequest(changeIndex: Int, line: Int? = null): SimpleDiffRequest? {
+    fun createRequest(changeIndex: Int, line: Int? = null, side: Side = Side.RIGHT): SimpleDiffRequest? {
         val session = currentSession ?: return null
         val change = session.changes.getOrNull(changeIndex) ?: return null
-        return buildRequest(session, change, line)
+        return buildRequest(session, change, line, side)
+    }
+
+    fun navigateToFileDiff(targetFile: VirtualFile, line: Int): Boolean {
+        val session = currentSession ?: return false
+        val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return false
+        val existingIndex = findChangeIndex(session, relativePath, relativePath, relativePath)
+        if (existingIndex >= 0) {
+            val change = session.changes[existingIndex]
+            showSession(session, ReviewNavigation(existingIndex, line, preferredSide(change)))
+            return true
+        }
+
+        val runtimeChange = buildRuntimeChange(session, targetFile) ?: return false
+        val updatedSession = session.copy(changes = session.changes + runtimeChange)
+        val nextIndex = updatedSession.changes.lastIndex
+        showSession(updatedSession, ReviewNavigation(nextIndex, line, preferredSide(runtimeChange)))
+        return true
     }
 
     fun navigateToComment(commentId: String): Boolean {
@@ -311,7 +328,7 @@ class MrReviewService(private val project: Project) {
         )
     }
 
-    private fun buildRequest(session: MrReviewSession, change: MrReviewChange, line: Int?): SimpleDiffRequest {
+    private fun buildRequest(session: MrReviewSession, change: MrReviewChange, line: Int?, side: Side): SimpleDiffRequest {
         val displayPath = change.newPath ?: change.oldPath ?: "unknown"
         val fileType = FileTypeManager.getInstance().getFileTypeByFileName(displayPath)
         val oldContent = createDiffContent(change.oldContent, change.oldPath, referentForOld(change), fileType)
@@ -330,11 +347,11 @@ class MrReviewService(private val project: Project) {
             "${session.targetRef} (${session.mergeBaseCommit.take(8)})",
             "${session.sourceBranch} (${session.headCommit.take(8)})"
         ).apply {
-            putUserData(DiffUserDataKeys.PREFERRED_FOCUS_SIDE, Side.RIGHT)
-            putUserData(DiffUserDataKeys.FORCE_READ_ONLY_CONTENTS, booleanArrayOf(true, false))
+            putUserData(DiffUserDataKeys.PREFERRED_FOCUS_SIDE, side)
+            putUserData(DiffUserDataKeys.FORCE_READ_ONLY_CONTENTS, booleanArrayOf(true, true))
             putUserData(DiffUserDataKeys.CONTEXT_ACTIONS, listOf(AddCommentAction()))
             if (line != null) {
-                putUserData(DiffUserDataKeys.SCROLL_TO_LINE, Pair.create(Side.RIGHT, (line - 1).coerceAtLeast(0)))
+                putUserData(DiffUserDataKeys.SCROLL_TO_LINE, Pair.create(side, (line - 1).coerceAtLeast(0)))
             }
             putUserData(DiffUserDataKeys.DATA_PROVIDER, DataProvider { dataId ->
                 val target = ReviewDiffCommentTarget(
@@ -437,6 +454,35 @@ class MrReviewService(private val project: Project) {
         )
     }
 
+    private fun buildRuntimeChange(session: MrReviewSession, targetFile: VirtualFile): MrReviewChange? {
+        val repository = repository() ?: return null
+        val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return null
+        val existsOnTarget = gitFileExists(repository, session.targetRef, relativePath)
+        val existsOnHead = gitFileExists(repository, session.headCommit, relativePath)
+        if (!existsOnTarget && !existsOnHead) return null
+
+        val oldPath = relativePath.takeIf { existsOnTarget }
+        val newPath = relativePath.takeIf { existsOnHead }
+        val oldContent = oldPath?.let { gitShow(repository, session.targetRef, it) }.orEmpty()
+        val newContent = newPath?.let { gitShow(repository, session.headCommit, it) }.orEmpty()
+        val stats = diffStats(repository, session.targetRef, session.headCommit, oldPath, newPath)
+        val status = when {
+            oldPath == null -> "A"
+            newPath == null -> "D"
+            else -> "M"
+        }
+
+        return MrReviewChange(
+            status = status,
+            oldPath = oldPath,
+            newPath = newPath,
+            oldContent = oldContent,
+            newContent = newContent,
+            addedLines = stats.first,
+            removedLines = stats.second
+        )
+    }
+
     private fun containsBinaryMarker(text: String): Boolean =
         text.any { it == '\u0000' }
 
@@ -444,6 +490,9 @@ class MrReviewService(private val project: Project) {
         val result = git(repository, GitCommand.SHOW, "$revision:$path")
         return if (result.success) result.lines.joinToString("\n") else ""
     }
+
+    private fun gitFileExists(repository: GitRepository, revision: String, path: String): Boolean =
+        git(repository, GitCommand.CAT_FILE, "-e", "$revision:$path").success
 
     private fun diffStats(
         repository: GitRepository,
@@ -504,6 +553,9 @@ class MrReviewService(private val project: Project) {
         session.title?.takeIf { it.isNotBlank() }
             ?: session.mrId?.let { "MR !$it" }
             ?: "MR Diff Review"
+
+    private fun preferredSide(change: MrReviewChange): Side =
+        if (change.newPath != null) Side.RIGHT else Side.LEFT
 
     private fun matchesSession(session: MrReviewSession, targetRef: String?, headCommit: String?): Boolean =
         targetRef == session.targetRef && headCommit == session.headCommit
