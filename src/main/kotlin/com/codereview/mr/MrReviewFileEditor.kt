@@ -10,13 +10,17 @@ import com.codereview.service.MrReviewUiStateService
 import com.codereview.ui.CommentToolWindowService
 import com.codereview.util.ProjectFiles
 import com.intellij.icons.AllIcons
+import com.intellij.codeInsight.TargetElementUtil
+import com.intellij.codeInsight.navigation.actions.TypeDeclarationProvider
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffRequestPanel
 import com.intellij.diff.tools.util.DiffDataKeys
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.Side
 import com.intellij.ide.DataManager
+import com.intellij.ide.util.DefaultPsiElementCellRenderer
 import com.intellij.openapi.actionSystem.ActionManager
+import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.actionSystem.IdeActions
 import com.intellij.openapi.Disposable
@@ -36,6 +40,8 @@ import com.intellij.openapi.editor.markup.TextAttributes
 import com.intellij.openapi.fileEditor.FileEditor
 import com.intellij.openapi.fileEditor.FileEditorState
 import com.intellij.openapi.fileEditor.FileEditorStateLevel
+import com.intellij.openapi.keymap.KeymapUtil
+import com.intellij.openapi.ui.popup.JBPopupFactory
 import com.intellij.openapi.project.DumbAwareAction
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.util.IconLoader
@@ -45,12 +51,14 @@ import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiManager
 import com.intellij.psi.PsiPolyVariantReference
+import com.intellij.psi.search.searches.DefinitionsScopedSearch
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.OnePixelSplitter
 import com.intellij.ui.SearchTextField
 import com.intellij.ui.SimpleTextAttributes
 import com.intellij.ui.components.ActionLink
 import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBList
 import com.intellij.ui.components.JBScrollPane
 import com.intellij.ui.treeStructure.Tree
 import com.intellij.util.ui.JBUI
@@ -71,9 +79,8 @@ import javax.swing.event.DocumentListener
 import javax.swing.tree.DefaultMutableTreeNode
 import javax.swing.tree.DefaultTreeModel
 import javax.swing.tree.TreePath
-import kotlin.math.max
 import java.awt.event.MouseEvent
-import com.intellij.openapi.keymap.KeymapUtil
+import kotlin.math.max
 
 class MrReviewFileEditor(
     private val project: Project,
@@ -143,12 +150,18 @@ class MrReviewFileEditor(
     private var selectedChangeIndex = -1
     private var filterText = ""
     private var decoratedEditor: EditorEx? = null
-    private var navigationEditor: EditorEx? = null
+    private var navigationEditors: List<EditorEx> = emptyList()
     private var fileListVisible = uiState.fileListVisible()
     private var expandedListProportion = uiState.fileListProportion().coerceIn(0.05f, 0.95f)
 
     private val gotoDeclarationShortcut = CustomShortcutSet(
         *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_DECLARATION).shortcuts
+    )
+    private val gotoImplementationShortcut = CustomShortcutSet(
+        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_IMPLEMENTATION).shortcuts
+    )
+    private val gotoTypeDeclarationShortcut = CustomShortcutSet(
+        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_TYPE_DECLARATION).shortcuts
     )
     private val gotoBackShortcut = CustomShortcutSet(
         *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_BACK).shortcuts
@@ -156,7 +169,19 @@ class MrReviewFileEditor(
 
     private val navigateFromDiffAction = object : DumbAwareAction() {
         override fun actionPerformed(e: AnActionEvent) {
-            navigateFromDiffCaret()
+            navigateFromDiffCaret(editorFromEvent(e))
+        }
+    }
+
+    private val navigateToImplementationAction = object : DumbAwareAction() {
+        override fun actionPerformed(e: AnActionEvent) {
+            navigateToImplementationFromDiffCaret(editorFromEvent(e))
+        }
+    }
+
+    private val navigateToTypeDeclarationAction = object : DumbAwareAction() {
+        override fun actionPerformed(e: AnActionEvent) {
+            navigateToTypeDeclarationFromDiffCaret(editorFromEvent(e))
         }
     }
 
@@ -176,7 +201,12 @@ class MrReviewFileEditor(
             val mouseEvent = event.mouseEvent
             if (mouseEvent.button != MouseEvent.BUTTON1) return
             if (!mouseEvent.isMetaDown && !mouseEvent.isControlDown) return
-            if (navigateFromDiffOffset(event.editor as? EditorEx, event.logicalPosition.line, event.logicalPosition.column)) {
+            val handled = if (mouseEvent.isAltDown) {
+                navigateToImplementationFromDiffOffset(event.editor as? EditorEx, event.logicalPosition.line, event.logicalPosition.column)
+            } else {
+                navigateFromDiffOffset(event.editor as? EditorEx, event.logicalPosition.line, event.logicalPosition.column)
+            }
+            if (handled) {
                 mouseEvent.consume()
             }
         }
@@ -491,11 +521,11 @@ class MrReviewFileEditor(
             }
             val change = currentChange() ?: run {
                 decoratedEditor = editor
-                installNavigationSupport(editor)
+                installNavigationSupport()
                 return@invokeLater
             }
             decoratedEditor = editor
-            installNavigationSupport(editor)
+            installNavigationSupport()
 
             val comments = CommentService.getInstance(project).all().filter { matchesChange(it, change) }
             if (comments.isEmpty()) return@invokeLater
@@ -556,7 +586,7 @@ class MrReviewFileEditor(
     private fun currentChange(): MrReviewChange? =
         session?.changes?.getOrNull(selectedChangeIndex)
 
-    private fun currentRightEditor(): EditorEx? {
+    private fun currentViewer(): TwosideTextDiffViewer? {
         val dataManager = DataManager.getInstance()
         val probeComponents = buildList<Component> {
             add(requestPanel.component)
@@ -575,16 +605,14 @@ class MrReviewFileEditor(
             val viewer = DiffDataKeys.DIFF_VIEWER.getData(dataContext)
                 ?: DiffDataKeys.WRAPPING_DIFF_VIEWER.getData(dataContext)
             if (viewer is TwosideTextDiffViewer) {
-                return viewer.editor2 as? EditorEx
-            }
-
-            val editor = DiffDataKeys.CURRENT_EDITOR.getData(dataContext)
-            if (editor is EditorEx) {
-                return editor
+                return viewer
             }
         }
         return null
     }
+
+    private fun currentRightEditor(): EditorEx? =
+        currentViewer()?.editor2 as? EditorEx
 
     private fun clearMarkers(editor: EditorEx) {
         editor.markupModel.allHighlighters
@@ -596,41 +624,121 @@ class MrReviewFileEditor(
             .forEach(editor.markupModel::removeHighlighter)
     }
 
-    private fun installNavigationSupport(editor: EditorEx) {
-        if (navigationEditor === editor) return
+    private fun installNavigationSupport() {
+        val editors = buildList {
+            currentViewer()?.let { viewer ->
+                (viewer.editor1 as? EditorEx)?.let(::add)
+                (viewer.editor2 as? EditorEx)?.let(::add)
+            }
+        }
+        if (navigationEditors == editors) return
         uninstallNavigationSupport()
-        navigationEditor = editor
-        navigateFromDiffAction.registerCustomShortcutSet(gotoDeclarationShortcut, editor.contentComponent, this)
-        navigateBackFromDiffAction.registerCustomShortcutSet(gotoBackShortcut, editor.contentComponent, this)
-        editor.addEditorMouseListener(navigateMouseListener, this)
+        navigationEditors = editors
+        editors.forEach { editor ->
+            navigateFromDiffAction.registerCustomShortcutSet(gotoDeclarationShortcut, editor.contentComponent, this)
+            navigateToImplementationAction.registerCustomShortcutSet(gotoImplementationShortcut, editor.contentComponent, this)
+            navigateToTypeDeclarationAction.registerCustomShortcutSet(gotoTypeDeclarationShortcut, editor.contentComponent, this)
+            navigateBackFromDiffAction.registerCustomShortcutSet(gotoBackShortcut, editor.contentComponent, this)
+            editor.addEditorMouseListener(navigateMouseListener, this)
+        }
     }
 
     private fun uninstallNavigationSupport() {
-        navigationEditor?.let { navigateFromDiffAction.unregisterCustomShortcutSet(it.contentComponent) }
-        navigationEditor?.let { navigateBackFromDiffAction.unregisterCustomShortcutSet(it.contentComponent) }
-        navigationEditor = null
+        navigationEditors.forEach { editor ->
+            navigateFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
+            navigateToImplementationAction.unregisterCustomShortcutSet(editor.contentComponent)
+            navigateToTypeDeclarationAction.unregisterCustomShortcutSet(editor.contentComponent)
+            navigateBackFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
+        }
+        navigationEditors = emptyList()
     }
 
-    private fun navigateFromDiffCaret(): Boolean {
-        val editor = navigationEditor ?: currentRightEditor() ?: return false
-        val offset = editor.caretModel.offset.coerceAtLeast(0)
-        val line = editor.document.getLineNumber(offset)
-        val column = offset - editor.document.getLineStartOffset(line)
-        return navigateFromDiffOffset(editor, line, column)
+    private fun navigateFromDiffCaret(editor: EditorEx?): Boolean {
+        val actualEditor = editor ?: currentRightEditor() ?: return false
+        val offset = actualEditor.caretModel.offset.coerceAtLeast(0)
+        val line = actualEditor.document.getLineNumber(offset)
+        val column = offset - actualEditor.document.getLineStartOffset(line)
+        return navigateFromDiffOffset(actualEditor, line, column)
     }
+
+    private fun navigateToImplementationFromDiffCaret(editor: EditorEx?): Boolean {
+        val actualEditor = editor ?: currentRightEditor() ?: return false
+        val offset = actualEditor.caretModel.offset.coerceAtLeast(0)
+        val line = actualEditor.document.getLineNumber(offset)
+        val column = offset - actualEditor.document.getLineStartOffset(line)
+        return navigateToImplementationFromDiffOffset(actualEditor, line, column)
+    }
+
+    private fun navigateToTypeDeclarationFromDiffCaret(editor: EditorEx?): Boolean {
+        val actualEditor = editor ?: currentRightEditor() ?: return false
+        val offset = actualEditor.caretModel.offset.coerceAtLeast(0)
+        val line = actualEditor.document.getLineNumber(offset)
+        val column = offset - actualEditor.document.getLineStartOffset(line)
+        return navigateToTypeDeclarationFromDiffOffset(actualEditor, line, column)
+    }
+
+    private fun editorFromEvent(e: AnActionEvent): EditorEx? =
+        (CommonDataKeys.EDITOR.getData(e.dataContext) as? EditorEx)
 
     private fun navigateFromDiffOffset(editor: EditorEx?, line: Int, column: Int): Boolean {
-        val change = currentChange() ?: return false
-        val contextFile = ProjectFiles.find(project, change.newPath ?: change.oldPath ?: return false) ?: return false
-        val psiFile = PsiManager.getInstance(project).findFile(contextFile) ?: return false
-        val document = PsiDocumentManager.getInstance(project).getDocument(psiFile) ?: return false
+        val navigationContext = navigationContext(editor, line, column) ?: return false
+        val target = resolveNavigationTarget(navigationContext.psiFile, navigationContext.offset) ?: return false
+        return navigateToPsiTarget(target, line + 1, navigationContext.side)
+    }
+
+    private fun navigateToImplementationFromDiffOffset(editor: EditorEx?, line: Int, column: Int): Boolean {
+        val actualEditor = editor ?: currentRightEditor() ?: return false
+        val navigationContext = navigationContext(actualEditor, line, column) ?: return false
+        val source = resolveImplementationSourceElement(navigationContext.psiFile, navigationContext.offset) ?: return false
+        val targets = DefinitionsScopedSearch.search(source)
+            .findAll()
+            .distinctBy { target ->
+                val filePath = target.containingFile?.virtualFile?.path.orEmpty()
+                "$filePath:${target.textOffset}"
+            }
+            .toList()
+        return when (targets.size) {
+            0 -> false
+            1 -> navigateToPsiTarget(targets.first(), line + 1, navigationContext.side)
+            else -> showImplementationChooser(actualEditor, source, targets, line + 1, navigationContext.side)
+        }
+    }
+
+    private fun navigateToTypeDeclarationFromDiffOffset(editor: EditorEx?, line: Int, column: Int): Boolean {
+        val navigationContext = navigationContext(editor, line, column) ?: return false
+        val source = resolveSourceElement(navigationContext.psiFile, navigationContext.offset) ?: return false
+        val target = TypeDeclarationProvider.EP_NAME.extensionList
+            .asSequence()
+            .flatMap { provider -> (provider.getSymbolTypeDeclarations(source) ?: emptyArray()).asSequence() }
+            .firstOrNull()
+            ?: return false
+        return navigateToPsiTarget(target, line + 1, navigationContext.side)
+    }
+
+    private fun navigationContext(editor: EditorEx?, line: Int, column: Int): NavigationContext? {
+        val change = currentChange() ?: return null
+        val side = sideForEditor(editor)
+        val relativePath = when (side) {
+            Side.LEFT -> change.oldPath ?: change.newPath
+            Side.RIGHT -> change.newPath ?: change.oldPath
+        } ?: return null
+        val contextFile = ProjectFiles.find(project, relativePath) ?: return null
+        val psiFile = PsiManager.getInstance(project).findFile(contextFile) ?: return null
+        val document = PsiDocumentManager.getInstance(project).getDocument(psiFile) ?: return null
         PsiDocumentManager.getInstance(project).commitAllDocuments()
 
         val safeLine = line.coerceIn(0, document.lineCount - 1)
         val lineStart = document.getLineStartOffset(safeLine)
         val lineEnd = document.getLineEndOffset(safeLine)
-        val targetOffset = (lineStart + column).coerceIn(lineStart, lineEnd)
-        val target = resolveNavigationTarget(psiFile, targetOffset) ?: return false
+        return NavigationContext(psiFile, (lineStart + column).coerceIn(lineStart, lineEnd), side)
+    }
+
+    private fun navigateBackInDiff(): Boolean {
+        if (!service.canNavigateBackInDiff()) return false
+        return service.navigateBackInDiff()
+    }
+
+    private fun navigateToPsiTarget(target: PsiElement, sourceLine: Int, sourceSide: Side): Boolean {
         val targetPsiFile = target.containingFile ?: return false
         val targetFile = targetPsiFile.virtualFile ?: return false
         val targetDocument = PsiDocumentManager.getInstance(project).getDocument(targetPsiFile) ?: return false
@@ -638,13 +746,31 @@ class MrReviewFileEditor(
         return service.navigateToFileDiff(
             targetFile,
             targetLine,
-            MrReviewService.ReviewNavigation(selectedChangeIndex, line + 1, Side.RIGHT)
+            MrReviewService.ReviewNavigation(selectedChangeIndex, sourceLine, sourceSide)
         )
     }
 
-    private fun navigateBackInDiff(): Boolean {
-        if (!service.canNavigateBackInDiff()) return false
-        return service.navigateBackInDiff()
+    private fun showImplementationChooser(
+        editor: EditorEx,
+        source: PsiElement,
+        targets: List<PsiElement>,
+        sourceLine: Int,
+        sourceSide: Side
+    ): Boolean {
+        val title = "Choose Implementation of ${source.text} (${targets.size} found)"
+        val list = JBList(targets).apply {
+            cellRenderer = DefaultPsiElementCellRenderer()
+            selectedIndex = 0
+        }
+        val popup = JBPopupFactory.getInstance()
+            .createListPopupBuilder(list)
+            .setTitle(title)
+            .setItemChoosenCallback {
+                list.selectedValue?.let { navigateToPsiTarget(it, sourceLine, sourceSide) }
+            }
+            .createPopup()
+        popup.showInBestPositionFor(editor)
+        return true
     }
 
     private fun resolveNavigationTarget(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {
@@ -660,6 +786,25 @@ class MrReviewFileEditor(
             resolveElementTarget(element)?.let { return it }
         }
         return null
+    }
+
+    private fun resolveSourceElement(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {
+        val maxOffset = psiFile.textLength.coerceAtLeast(1) - 1
+        val offsets = buildList {
+            add(offset.coerceIn(0, maxOffset))
+            if (offset > 0) add((offset - 1).coerceIn(0, maxOffset))
+        }.distinct()
+
+        offsets.forEach { candidateOffset ->
+            psiFile.findReferenceAt(candidateOffset)?.element?.let { return it }
+            psiFile.findElementAt(candidateOffset)?.let { return it }
+        }
+        return null
+    }
+
+    private fun resolveImplementationSourceElement(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {
+        val source = resolveSourceElement(psiFile, offset) ?: return null
+        return TargetElementUtil.getNamedElement(source) ?: source
     }
 
     private fun resolveReferenceTarget(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {
@@ -678,6 +823,20 @@ class MrReviewFileEditor(
             current = current.parent
         }
         return null
+    }
+
+    private data class NavigationContext(
+        val psiFile: com.intellij.psi.PsiFile,
+        val offset: Int,
+        val side: Side
+    )
+
+    private fun sideForEditor(editor: EditorEx?): Side {
+        val viewer = currentViewer() ?: return Side.RIGHT
+        return when (editor) {
+            viewer.editor1 -> Side.LEFT
+            else -> Side.RIGHT
+        }
     }
 
     private fun matchesFilter(change: MrReviewChange, query: String): Boolean {
