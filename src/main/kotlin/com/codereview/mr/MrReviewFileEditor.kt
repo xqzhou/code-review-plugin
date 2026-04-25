@@ -6,6 +6,7 @@ import com.codereview.model.ReviewComment
 import com.codereview.service.CommentSelectionService
 import com.codereview.service.CommentService
 import com.codereview.service.MrReviewService
+import com.codereview.service.MrReviewUiStateService
 import com.codereview.ui.CommentToolWindowService
 import com.codereview.util.ProjectFiles
 import com.intellij.icons.AllIcons
@@ -15,6 +16,7 @@ import com.intellij.diff.tools.util.DiffDataKeys
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.Side
 import com.intellij.ide.DataManager
+import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.actionSystem.IdeActions
 import com.intellij.openapi.Disposable
@@ -79,6 +81,7 @@ class MrReviewFileEditor(
 ) : UserDataHolderBase(), FileEditor, Disposable {
 
     private val service = MrReviewService.getInstance(project)
+    private val uiState = MrReviewUiStateService.getInstance(project)
     private val propertyChangeSupport = PropertyChangeSupport(this)
     private val requestPanel: DiffRequestPanel = DiffManager.getInstance().createRequestPanel(project, this, null)
 
@@ -92,6 +95,9 @@ class MrReviewFileEditor(
     }
     private val metaLabel = JBLabel().apply {
         foreground = UIUtil.getContextHelpForeground()
+    }
+    private val currentFileLabel = JBLabel().apply {
+        horizontalAlignment = SwingConstants.CENTER
     }
     private val searchField = SearchTextField(false).apply {
         textEditor.emptyText.text = "Search files..."
@@ -138,16 +144,30 @@ class MrReviewFileEditor(
     private var filterText = ""
     private var decoratedEditor: EditorEx? = null
     private var navigationEditor: EditorEx? = null
-    private var fileListVisible = true
-    private var expandedListProportion = 0.24f
+    private var fileListVisible = uiState.fileListVisible()
+    private var expandedListProportion = uiState.fileListProportion().coerceIn(0.05f, 0.95f)
 
     private val gotoDeclarationShortcut = CustomShortcutSet(
         *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_DECLARATION).shortcuts
+    )
+    private val gotoBackShortcut = CustomShortcutSet(
+        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_BACK).shortcuts
     )
 
     private val navigateFromDiffAction = object : DumbAwareAction() {
         override fun actionPerformed(e: AnActionEvent) {
             navigateFromDiffCaret()
+        }
+    }
+
+    private val navigateBackFromDiffAction = object : DumbAwareAction() {
+        override fun actionPerformed(e: AnActionEvent) {
+            if (!navigateBackInDiff()) {
+                val action = ActionManager.getInstance().getAction(IdeActions.ACTION_GOTO_BACK) ?: return
+                action.actionPerformed(
+                    AnActionEvent.createFromAnAction(action, e.inputEvent, e.place, e.dataContext)
+                )
+            }
         }
     }
 
@@ -182,6 +202,11 @@ class MrReviewFileEditor(
             add(titleLabel)
             add(metaLabel)
         }
+        val headerCurrentFile = JPanel(BorderLayout()).apply {
+            isOpaque = false
+            border = JBUI.Borders.emptyLeft(12)
+            add(currentFileLabel, BorderLayout.CENTER)
+        }
 
         val headerActions = JPanel(FlowLayout(FlowLayout.RIGHT, JBUI.scale(10), 0)).apply {
             isOpaque = false
@@ -191,6 +216,7 @@ class MrReviewFileEditor(
         val header = JPanel(BorderLayout()).apply {
             border = JBUI.Borders.empty(10, 12)
             add(headerInfo, BorderLayout.WEST)
+            add(headerCurrentFile, BorderLayout.CENTER)
             add(headerActions, BorderLayout.EAST)
         }
 
@@ -264,6 +290,7 @@ class MrReviewFileEditor(
 
     override fun dispose() {
         decoratedEditor?.let(::clearMarkers)
+        persistFileListState()
         uninstallNavigationSupport()
     }
 
@@ -292,6 +319,7 @@ class MrReviewFileEditor(
         if (session == null) {
             titleLabel.text = "MR Review"
             metaLabel.text = "No active MR diff review."
+            renderCurrentFile(null)
             return
         }
         titleLabel.text = session.title?.takeIf { it.isNotBlank() }
@@ -402,6 +430,7 @@ class MrReviewFileEditor(
     private fun showChange(index: Int, line: Int?, side: Side) {
         val request = service.createRequest(index, line, side) ?: return
         selectedChangeIndex = index
+        renderCurrentFile(currentChange())
         diffContainer.removeAll()
         diffContainer.add(requestPanel.component, BorderLayout.CENTER)
         requestPanel.setRequest(request)
@@ -412,6 +441,7 @@ class MrReviewFileEditor(
 
     private fun clearDiffPanel() {
         selectedChangeIndex = -1
+        renderCurrentFile(null)
         decoratedEditor?.let(::clearMarkers)
         decoratedEditor = null
         diffContainer.removeAll()
@@ -426,6 +456,7 @@ class MrReviewFileEditor(
         }
         fileListVisible = !fileListVisible
         updateFileListVisibility()
+        persistFileListState()
     }
 
     private fun updateFileListVisibility() {
@@ -435,6 +466,19 @@ class MrReviewFileEditor(
         toggleFilesLink.text = if (fileListVisible) "Hide Files" else "Show Files"
         splitter.revalidate()
         splitter.repaint()
+    }
+
+    private fun persistFileListState() {
+        if (fileListVisible) {
+            expandedListProportion = splitter.proportion.coerceIn(0.05f, 0.95f)
+        }
+        uiState.setFileListState(fileListVisible, expandedListProportion)
+    }
+
+    private fun renderCurrentFile(change: MrReviewChange?) {
+        val path = change?.displayPath().orEmpty()
+        currentFileLabel.text = path
+        currentFileLabel.toolTipText = path.ifBlank { null }
     }
 
     private fun refreshDiffDecorations() {
@@ -557,11 +601,13 @@ class MrReviewFileEditor(
         uninstallNavigationSupport()
         navigationEditor = editor
         navigateFromDiffAction.registerCustomShortcutSet(gotoDeclarationShortcut, editor.contentComponent, this)
+        navigateBackFromDiffAction.registerCustomShortcutSet(gotoBackShortcut, editor.contentComponent, this)
         editor.addEditorMouseListener(navigateMouseListener, this)
     }
 
     private fun uninstallNavigationSupport() {
         navigationEditor?.let { navigateFromDiffAction.unregisterCustomShortcutSet(it.contentComponent) }
+        navigationEditor?.let { navigateBackFromDiffAction.unregisterCustomShortcutSet(it.contentComponent) }
         navigationEditor = null
     }
 
@@ -589,7 +635,16 @@ class MrReviewFileEditor(
         val targetFile = targetPsiFile.virtualFile ?: return false
         val targetDocument = PsiDocumentManager.getInstance(project).getDocument(targetPsiFile) ?: return false
         val targetLine = targetDocument.getLineNumber(target.textOffset.coerceAtLeast(0)) + 1
-        return service.navigateToFileDiff(targetFile, targetLine)
+        return service.navigateToFileDiff(
+            targetFile,
+            targetLine,
+            MrReviewService.ReviewNavigation(selectedChangeIndex, line + 1, Side.RIGHT)
+        )
+    }
+
+    private fun navigateBackInDiff(): Boolean {
+        if (!service.canNavigateBackInDiff()) return false
+        return service.navigateBackInDiff()
     }
 
     private fun resolveNavigationTarget(psiFile: com.intellij.psi.PsiFile, offset: Int): PsiElement? {

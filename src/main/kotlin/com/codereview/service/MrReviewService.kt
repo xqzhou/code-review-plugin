@@ -37,6 +37,7 @@ import git4idea.commands.GitCommand
 import git4idea.commands.GitLineHandler
 import git4idea.repo.GitRepository
 import git4idea.repo.GitRepositoryManager
+import java.util.ArrayDeque
 
 @Service(Service.Level.PROJECT)
 class MrReviewService(private val project: Project) {
@@ -52,6 +53,7 @@ class MrReviewService(private val project: Project) {
     private var currentSession: MrReviewSession? = null
     private var currentNavigation: ReviewNavigation? = null
     private var reviewFile: MrReviewVirtualFile? = null
+    private val diffBackStack = ArrayDeque<ReviewNavigation>()
 
     fun openReview() {
         val session = prepareSession() ?: return
@@ -63,6 +65,7 @@ class MrReviewService(private val project: Project) {
             )
             return
         }
+        diffBackStack.clear()
         showSession(session, null)
         if (session.skippedBinaryFiles > 0) {
             CommentNotifications.info(
@@ -83,12 +86,13 @@ class MrReviewService(private val project: Project) {
         return buildRequest(session, change, line, side)
     }
 
-    fun navigateToFileDiff(targetFile: VirtualFile, line: Int): Boolean {
+    fun navigateToFileDiff(targetFile: VirtualFile, line: Int, from: ReviewNavigation? = null): Boolean {
         val session = currentSession ?: return false
         val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return false
         val existingIndex = findChangeIndex(session, relativePath, relativePath, relativePath)
         if (existingIndex >= 0) {
             val change = session.changes[existingIndex]
+            from?.let(::pushDiffBackNavigation)
             showSession(session, ReviewNavigation(existingIndex, line, preferredSide(change)))
             return true
         }
@@ -96,7 +100,17 @@ class MrReviewService(private val project: Project) {
         val runtimeChange = buildRuntimeChange(session, targetFile) ?: return false
         val updatedSession = session.copy(changes = session.changes + runtimeChange)
         val nextIndex = updatedSession.changes.lastIndex
+        from?.let(::pushDiffBackNavigation)
         showSession(updatedSession, ReviewNavigation(nextIndex, line, preferredSide(runtimeChange)))
+        return true
+    }
+
+    fun canNavigateBackInDiff(): Boolean = diffBackStack.isNotEmpty()
+
+    fun navigateBackInDiff(): Boolean {
+        if (diffBackStack.isEmpty()) return false
+        val session = currentSession ?: return false
+        showSession(session, diffBackStack.removeLast())
         return true
     }
 
@@ -202,10 +216,18 @@ class MrReviewService(private val project: Project) {
     }
 
     private fun showSession(session: MrReviewSession, navigation: ReviewNavigation?) {
+        val previousSessionKey = currentSession?.sessionKey
         currentSession = session
         currentNavigation = navigation
+        if (previousSessionKey != null && previousSessionKey != session.sessionKey) {
+            diffBackStack.clear()
+        }
         openReviewFile(session, navigation)
         project.messageBus.syncPublisher(TOPIC).onReviewSessionChanged(currentSession, currentNavigation)
+    }
+
+    private fun pushDiffBackNavigation(navigation: ReviewNavigation) {
+        diffBackStack.addLast(navigation)
     }
 
     private fun openReviewFile(session: MrReviewSession, navigation: ReviewNavigation?) {
