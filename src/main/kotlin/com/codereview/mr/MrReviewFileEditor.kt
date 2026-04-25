@@ -1,0 +1,735 @@
+package com.codereview.mr
+
+import com.codereview.model.MrReviewChange
+import com.codereview.model.MrReviewSession
+import com.codereview.model.ReviewComment
+import com.codereview.service.CommentSelectionService
+import com.codereview.service.CommentService
+import com.codereview.service.MrReviewService
+import com.codereview.ui.CommentToolWindowService
+import com.codereview.util.ProjectFiles
+import com.intellij.icons.AllIcons
+import com.intellij.codeInsight.navigation.actions.GotoDeclarationAction
+import com.intellij.diff.DiffManager
+import com.intellij.diff.DiffRequestPanel
+import com.intellij.diff.tools.util.DiffDataKeys
+import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
+import com.intellij.ide.DataManager
+import com.intellij.openapi.actionSystem.CustomShortcutSet
+import com.intellij.openapi.actionSystem.IdeActions
+import com.intellij.openapi.Disposable
+import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.AnAction
+import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.editor.colors.EditorColors
+import com.intellij.openapi.editor.colors.EditorColorsManager
+import com.intellij.openapi.editor.ex.EditorEx
+import com.intellij.openapi.editor.event.EditorMouseAdapter
+import com.intellij.openapi.editor.event.EditorMouseEvent
+import com.intellij.openapi.editor.markup.EffectType
+import com.intellij.openapi.editor.markup.GutterIconRenderer
+import com.intellij.openapi.editor.markup.HighlighterLayer
+import com.intellij.openapi.editor.markup.HighlighterTargetArea
+import com.intellij.openapi.editor.markup.TextAttributes
+import com.intellij.openapi.fileEditor.FileEditor
+import com.intellij.openapi.fileEditor.FileEditorManager
+import com.intellij.openapi.fileEditor.FileEditorState
+import com.intellij.openapi.fileEditor.FileEditorStateLevel
+import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.openapi.project.DumbAwareAction
+import com.intellij.openapi.project.Project
+import com.intellij.openapi.util.IconLoader
+import com.intellij.openapi.util.Key
+import com.intellij.openapi.util.UserDataHolderBase
+import com.intellij.psi.PsiDocumentManager
+import com.intellij.ui.ColoredTreeCellRenderer
+import com.intellij.ui.OnePixelSplitter
+import com.intellij.ui.SearchTextField
+import com.intellij.ui.SimpleTextAttributes
+import com.intellij.ui.components.ActionLink
+import com.intellij.ui.components.JBLabel
+import com.intellij.ui.components.JBScrollPane
+import com.intellij.ui.treeStructure.Tree
+import com.intellij.util.ui.JBUI
+import com.intellij.util.ui.UIUtil
+import java.awt.BorderLayout
+import java.awt.Color
+import java.awt.Component
+import java.awt.FlowLayout
+import java.beans.PropertyChangeListener
+import java.beans.PropertyChangeSupport
+import javax.swing.BorderFactory
+import javax.swing.JComponent
+import javax.swing.JPanel
+import javax.swing.SwingConstants
+import javax.swing.SwingUtilities
+import javax.swing.event.DocumentEvent
+import javax.swing.event.DocumentListener
+import javax.swing.tree.DefaultMutableTreeNode
+import javax.swing.tree.DefaultTreeModel
+import javax.swing.tree.TreePath
+import kotlin.math.max
+import java.awt.event.MouseEvent
+import com.intellij.openapi.keymap.KeymapUtil
+import com.intellij.util.PsiNavigateUtil
+
+class MrReviewFileEditor(
+    private val project: Project,
+    private val file: MrReviewVirtualFile
+) : UserDataHolderBase(), FileEditor, Disposable {
+
+    private val service = MrReviewService.getInstance(project)
+    private val propertyChangeSupport = PropertyChangeSupport(this)
+    private val requestPanel: DiffRequestPanel = DiffManager.getInstance().createRequestPanel(project, this, null)
+
+    private val lineMarkerKey = Key.create<Boolean>("code.review.mr.line.marker")
+    private val rangeMarkerKey = Key.create<Boolean>("code.review.mr.range.marker")
+    private val selectedRangeMarkerKey = Key.create<Boolean>("code.review.mr.selected.range.marker")
+    private val commentIcon = IconLoader.getIcon("/icons/comment.svg", MrReviewFileEditor::class.java)
+
+    private val titleLabel = JBLabel("MR Review").apply {
+        font = UIUtil.getLabelFont().deriveFont(UIUtil.getLabelFont().size2D + 1f)
+    }
+    private val metaLabel = JBLabel().apply {
+        foreground = UIUtil.getContextHelpForeground()
+    }
+    private val searchField = SearchTextField(false).apply {
+        textEditor.emptyText.text = "Search files..."
+    }
+
+    private val treeModel = DefaultTreeModel(DefaultMutableTreeNode(TreeEntry.Root))
+    private val changesTree = Tree(treeModel).apply {
+        isRootVisible = false
+        showsRootHandles = true
+        selectionModel.selectionMode = javax.swing.tree.TreeSelectionModel.SINGLE_TREE_SELECTION
+        cellRenderer = ChangeTreeRenderer()
+        rowHeight = 0
+        setLineStyleAngled()
+        emptyText.text = "No changed files"
+        border = JBUI.Borders.empty(4, 0)
+    }
+    private val placeholder = JPanel(BorderLayout()).apply {
+        add(
+            JBLabel("Select a changed file to review.").apply {
+                horizontalAlignment = SwingConstants.CENTER
+                foreground = UIUtil.getContextHelpForeground()
+                border = JBUI.Borders.empty(24)
+            },
+            BorderLayout.CENTER
+        )
+    }
+    private val diffContainer = JPanel(BorderLayout()).apply {
+        add(placeholder, BorderLayout.CENTER)
+    }
+    private val collapsedListPanel = JPanel(BorderLayout()).apply {
+        isOpaque = false
+        minimumSize = JBUI.emptySize()
+        preferredSize = JBUI.emptySize()
+    }
+    private lateinit var splitter: OnePixelSplitter
+    private lateinit var listPanel: JPanel
+    private val toggleFilesLink = ActionLink("Hide Files") { toggleFileList() }
+
+    private val root = JPanel(BorderLayout())
+
+    private var session: MrReviewSession? = null
+    private var applyingSelection = false
+    private var selectedChangeIndex = -1
+    private var filterText = ""
+    private var decoratedEditor: EditorEx? = null
+    private var navigationEditor: EditorEx? = null
+    private var fileListVisible = true
+    private var expandedListProportion = 0.24f
+
+    private val gotoDeclarationShortcut = CustomShortcutSet(
+        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_DECLARATION).shortcuts
+    )
+
+    private val navigateFromDiffAction = object : DumbAwareAction() {
+        override fun actionPerformed(e: AnActionEvent) {
+            navigateFromDiffCaret()
+        }
+    }
+
+    private val navigateMouseListener = object : EditorMouseAdapter() {
+        override fun mouseClicked(event: EditorMouseEvent) {
+            val mouseEvent = event.mouseEvent
+            if (mouseEvent.button != MouseEvent.BUTTON1) return
+            if (!mouseEvent.isMetaDown && !mouseEvent.isControlDown) return
+            if (navigateFromDiffOffset(event.editor as? EditorEx, event.logicalPosition.line, event.logicalPosition.column)) {
+                mouseEvent.consume()
+            }
+        }
+    }
+
+    init {
+        listPanel = JPanel(BorderLayout()).apply {
+            border = BorderFactory.createCompoundBorder(
+                JBUI.Borders.customLineRight(JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()),
+                JBUI.Borders.empty(8)
+            )
+            add(searchField.apply { border = JBUI.Borders.emptyBottom(8) }, BorderLayout.NORTH)
+            add(JBScrollPane(changesTree).apply { border = BorderFactory.createEmptyBorder() }, BorderLayout.CENTER)
+        }
+        splitter = OnePixelSplitter(false, expandedListProportion, 0.0f, 1.0f).apply {
+            firstComponent = listPanel
+            secondComponent = diffContainer
+            dividerWidth = JBUI.scale(1)
+            setHonorComponentsMinimumSize(false)
+        }
+        val headerInfo = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(12), 0)).apply {
+            isOpaque = false
+            add(titleLabel)
+            add(metaLabel)
+        }
+
+        val header = JPanel(BorderLayout()).apply {
+            border = JBUI.Borders.empty(10, 12)
+            add(headerInfo, BorderLayout.WEST)
+            add(toggleFilesLink, BorderLayout.EAST)
+        }
+
+        root.add(header, BorderLayout.NORTH)
+        root.add(splitter, BorderLayout.CENTER)
+        updateFileListVisibility()
+
+        searchField.addDocumentListener(object : DocumentListener {
+            override fun insertUpdate(e: DocumentEvent) = onSearchChanged()
+            override fun removeUpdate(e: DocumentEvent) = onSearchChanged()
+            override fun changedUpdate(e: DocumentEvent) = onSearchChanged()
+        })
+
+        changesTree.addTreeSelectionListener {
+            if (applyingSelection) return@addTreeSelectionListener
+            val entry = selectedTreeEntry() as? TreeEntry.File ?: return@addTreeSelectionListener
+            showChange(entry.index, null)
+        }
+
+        val connection = project.messageBus.connect(this)
+        connection.subscribe(MrReviewService.TOPIC, object : MrReviewService.Listener {
+            override fun onReviewSessionChanged(session: MrReviewSession?, navigation: MrReviewService.ReviewNavigation?) {
+                if (session != null && session.sessionKey == this@MrReviewFileEditor.session?.sessionKey) {
+                    if (navigation != null) {
+                        selectChange(navigation.changeIndex, navigation.line)
+                    } else {
+                        refreshDiffDecorations()
+                    }
+                } else {
+                    updateSession(session, navigation)
+                }
+            }
+        })
+        connection.subscribe(CommentService.TOPIC, object : CommentService.Listener {
+            override fun onCommentsChanged() = refreshDiffDecorations()
+        })
+        connection.subscribe(CommentSelectionService.TOPIC, object : CommentSelectionService.Listener {
+            override fun onCommentSelectionChanged(commentId: String?) = refreshDiffDecorations()
+        })
+
+        updateSession(service.currentSession(), service.currentNavigation())
+    }
+
+    override fun getComponent(): JComponent = root
+
+    override fun getPreferredFocusedComponent(): JComponent = changesTree
+
+    override fun getName(): String = "MR Review"
+
+    override fun getState(level: FileEditorStateLevel): FileEditorState = State(selectedChangeIndex)
+
+    override fun setState(state: FileEditorState) {
+        if (state is State && state.selectedChangeIndex >= 0) {
+            selectChange(state.selectedChangeIndex, null)
+        }
+    }
+
+    override fun isModified(): Boolean = false
+
+    override fun isValid(): Boolean = file.isValid
+
+    override fun addPropertyChangeListener(listener: PropertyChangeListener) {
+        propertyChangeSupport.addPropertyChangeListener(listener)
+    }
+
+    override fun removePropertyChangeListener(listener: PropertyChangeListener) {
+        propertyChangeSupport.removePropertyChangeListener(listener)
+    }
+
+    override fun getFile() = file
+
+    override fun dispose() {
+        decoratedEditor?.let(::clearMarkers)
+        uninstallNavigationSupport()
+    }
+
+    fun applySession(session: MrReviewSession, navigation: MrReviewService.ReviewNavigation?) {
+        updateSession(session, navigation)
+    }
+
+    private fun updateSession(session: MrReviewSession?, navigation: MrReviewService.ReviewNavigation?) {
+        this.session = session
+        renderHeader(session)
+        rebuildTree(session)
+
+        val targetIndex = navigation?.changeIndex
+            ?: selectedChangeIndex.takeIf { treeHasChangeIndex(it) }
+            ?: firstVisibleChangeIndex()
+            ?: -1
+        if (targetIndex >= 0) {
+            selectChange(targetIndex, navigation?.line)
+        } else {
+            selectedChangeIndex = -1
+            clearDiffPanel()
+        }
+    }
+
+    private fun renderHeader(session: MrReviewSession?) {
+        if (session == null) {
+            titleLabel.text = "MR Review"
+            metaLabel.text = "No active MR diff review."
+            return
+        }
+        titleLabel.text = session.title?.takeIf { it.isNotBlank() }
+            ?: session.mrId?.let { "MR !$it" }
+            ?: "MR Review"
+        metaLabel.text = "${session.targetRef} (${session.mergeBaseCommit.take(8)}) -> ${session.sourceBranch} (${session.headCommit.take(8)})"
+    }
+
+    private fun onSearchChanged() {
+        filterText = searchField.text.trim()
+        rebuildTree(session)
+        val targetIndex = selectedChangeIndex.takeIf { treeHasChangeIndex(it) } ?: firstVisibleChangeIndex()
+        if (targetIndex != null) {
+            selectTreeNode(targetIndex)
+        } else if (!changesTree.isSelectionEmpty) {
+            changesTree.clearSelection()
+        }
+    }
+
+    private fun rebuildTree(session: MrReviewSession?) {
+        val rootNode = DefaultMutableTreeNode(TreeEntry.Root)
+        val directoryNodes = linkedMapOf<String, DefaultMutableTreeNode>()
+        val query = filterText.lowercase()
+        session?.changes
+            ?.mapIndexed { index, change -> index to change }
+            ?.filter { (_, change) -> matchesFilter(change, query) }
+            ?.sortedBy { (_, change) -> change.displayPath() }
+            ?.forEach { (index, change) ->
+                val path = change.displayPath()
+                val parentPath = path.substringBeforeLast('/', "")
+                var parentNode = rootNode
+                if (parentPath.isNotBlank()) {
+                    var currentPath = ""
+                    parentPath.split('/').forEach { segment ->
+                        currentPath = if (currentPath.isEmpty()) segment else "$currentPath/$segment"
+                        val node = directoryNodes.getOrPut(currentPath) {
+                            DefaultMutableTreeNode(TreeEntry.Directory(segment, currentPath)).also(parentNode::add)
+                        }
+                        parentNode = node
+                    }
+                }
+                parentNode.add(DefaultMutableTreeNode(TreeEntry.File(index, change)))
+            }
+
+        treeModel.setRoot(rootNode)
+        expandAll()
+    }
+
+    private fun expandAll() {
+        var row = 0
+        while (row < changesTree.rowCount) {
+            changesTree.expandRow(row)
+            row += 1
+        }
+    }
+
+    private fun treeHasChangeIndex(index: Int): Boolean =
+        findTreePath(index) != null
+
+    private fun firstVisibleChangeIndex(): Int? {
+        val rootNode = treeModel.root as? DefaultMutableTreeNode ?: return null
+        val enumeration = rootNode.depthFirstEnumeration()
+        while (enumeration.hasMoreElements()) {
+            val node = enumeration.nextElement() as? DefaultMutableTreeNode ?: continue
+            val entry = node.userObject as? TreeEntry.File ?: continue
+            return entry.index
+        }
+        return null
+    }
+
+    private fun selectChange(index: Int, line: Int?) {
+        if (findTreePath(index) == null) return
+        selectTreeNode(index)
+        showChange(index, line)
+    }
+
+    private fun selectTreeNode(index: Int) {
+        val path = findTreePath(index) ?: return
+        applyingSelection = true
+        try {
+            if (changesTree.selectionPath != path) {
+                changesTree.selectionPath = path
+            }
+            changesTree.scrollPathToVisible(path)
+        } finally {
+            applyingSelection = false
+        }
+    }
+
+    private fun findTreePath(index: Int): TreePath? {
+        val rootNode = treeModel.root as? DefaultMutableTreeNode ?: return null
+        val enumeration = rootNode.depthFirstEnumeration()
+        while (enumeration.hasMoreElements()) {
+            val node = enumeration.nextElement() as? DefaultMutableTreeNode ?: continue
+            val entry = node.userObject as? TreeEntry.File ?: continue
+            if (entry.index == index) {
+                return TreePath(node.path)
+            }
+        }
+        return null
+    }
+
+    private fun selectedTreeEntry(): TreeEntry? {
+        val node = changesTree.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return null
+        return node.userObject as? TreeEntry
+    }
+
+    private fun showChange(index: Int, line: Int?) {
+        val request = service.createRequest(index, line) ?: return
+        selectedChangeIndex = index
+        diffContainer.removeAll()
+        diffContainer.add(requestPanel.component, BorderLayout.CENTER)
+        requestPanel.setRequest(request)
+        diffContainer.revalidate()
+        diffContainer.repaint()
+        SwingUtilities.invokeLater { refreshDiffDecorations() }
+    }
+
+    private fun clearDiffPanel() {
+        selectedChangeIndex = -1
+        decoratedEditor?.let(::clearMarkers)
+        decoratedEditor = null
+        diffContainer.removeAll()
+        diffContainer.add(placeholder, BorderLayout.CENTER)
+        diffContainer.revalidate()
+        diffContainer.repaint()
+    }
+
+    private fun toggleFileList() {
+        if (fileListVisible) {
+            expandedListProportion = splitter.proportion.coerceIn(0.05f, 0.95f)
+        }
+        fileListVisible = !fileListVisible
+        updateFileListVisibility()
+    }
+
+    private fun updateFileListVisibility() {
+        splitter.firstComponent = if (fileListVisible) listPanel else collapsedListPanel
+        splitter.dividerWidth = JBUI.scale(1)
+        splitter.proportion = if (fileListVisible) expandedListProportion else 0f
+        toggleFilesLink.text = if (fileListVisible) "Hide Files" else "Show Files"
+        splitter.revalidate()
+        splitter.repaint()
+    }
+
+    private fun refreshDiffDecorations() {
+        SwingUtilities.invokeLater {
+            decoratedEditor?.let(::clearMarkers)
+            val editor = currentRightEditor() ?: run {
+                decoratedEditor = null
+                uninstallNavigationSupport()
+                return@invokeLater
+            }
+            val change = currentChange() ?: run {
+                decoratedEditor = editor
+                installNavigationSupport(editor)
+                return@invokeLater
+            }
+            decoratedEditor = editor
+            installNavigationSupport(editor)
+
+            val comments = CommentService.getInstance(project).all().filter { matchesChange(it, change) }
+            if (comments.isEmpty()) return@invokeLater
+
+            val selectedCommentId = CommentSelectionService.getInstance(project).currentSelection()
+            val weakAttributes = rangeAttributes(selected = false)
+            val selectedAttributes = rangeAttributes(selected = true)
+
+            comments.forEach { comment ->
+                val startLineIndex = (comment.startLine - 1).coerceAtLeast(0)
+                val endLineIndex = (comment.endLine - 1).coerceAtLeast(startLineIndex)
+                if (startLineIndex !in 0 until editor.document.lineCount) return@forEach
+
+                val safeEndLine = endLineIndex.coerceAtMost(editor.document.lineCount - 1)
+                val startOffset = editor.document.getLineStartOffset(startLineIndex)
+                val endOffset = editor.document.getLineEndOffset(safeEndLine)
+
+                editor.markupModel.addRangeHighlighter(
+                    startOffset,
+                    endOffset,
+                    HighlighterLayer.ADDITIONAL_SYNTAX,
+                    weakAttributes,
+                    HighlighterTargetArea.EXACT_RANGE
+                ).apply {
+                    putUserData(rangeMarkerKey, true)
+                    errorStripeTooltip = tooltipFor(comment)
+                }
+
+                if (comment.id == selectedCommentId) {
+                    editor.markupModel.addRangeHighlighter(
+                        startOffset,
+                        endOffset,
+                        HighlighterLayer.SELECTION - 1,
+                        selectedAttributes,
+                        HighlighterTargetArea.EXACT_RANGE
+                    ).apply {
+                        putUserData(selectedRangeMarkerKey, true)
+                        errorStripeTooltip = tooltipFor(comment)
+                    }
+                }
+            }
+
+            comments
+                .sortedWith(compareBy({ it.startLine }, { it.endLine }, { it.createdAt }))
+                .groupBy { it.startLine }
+                .forEach { (line, groupedComments) ->
+                    val lineIndex = line - 1
+                    if (lineIndex !in 0 until editor.document.lineCount) return@forEach
+                    editor.markupModel.addLineHighlighter(lineIndex, HighlighterLayer.ADDITIONAL_SYNTAX, null).apply {
+                        putUserData(lineMarkerKey, true)
+                        gutterIconRenderer = CommentGutterRenderer(project, commentIcon, groupedComments)
+                        errorStripeTooltip = groupedComments.joinToString("\n\n") { tooltipFor(it) }
+                    }
+                }
+        }
+    }
+
+    private fun currentChange(): MrReviewChange? =
+        session?.changes?.getOrNull(selectedChangeIndex)
+
+    private fun currentRightEditor(): EditorEx? {
+        val dataManager = DataManager.getInstance()
+        val probeComponents = buildList<Component> {
+            add(requestPanel.component)
+            add(diffContainer)
+            if (requestPanel.component.width > 2 && requestPanel.component.height > 2) {
+                SwingUtilities.getDeepestComponentAt(
+                    requestPanel.component,
+                    max(requestPanel.component.width / 2, 1),
+                    max(requestPanel.component.height / 2, 1)
+                )?.let(::add)
+            }
+        }
+
+        probeComponents.forEach { component ->
+            val dataContext = dataManager.getDataContext(component)
+            val viewer = DiffDataKeys.DIFF_VIEWER.getData(dataContext)
+                ?: DiffDataKeys.WRAPPING_DIFF_VIEWER.getData(dataContext)
+            if (viewer is TwosideTextDiffViewer) {
+                return viewer.editor2 as? EditorEx
+            }
+
+            val editor = DiffDataKeys.CURRENT_EDITOR.getData(dataContext)
+            if (editor is EditorEx) {
+                return editor
+            }
+        }
+        return null
+    }
+
+    private fun clearMarkers(editor: EditorEx) {
+        editor.markupModel.allHighlighters
+            .filter {
+                it.getUserData(lineMarkerKey) == true ||
+                    it.getUserData(rangeMarkerKey) == true ||
+                    it.getUserData(selectedRangeMarkerKey) == true
+            }
+            .forEach(editor.markupModel::removeHighlighter)
+    }
+
+    private fun installNavigationSupport(editor: EditorEx) {
+        if (navigationEditor === editor) return
+        uninstallNavigationSupport()
+        navigationEditor = editor
+        navigateFromDiffAction.registerCustomShortcutSet(gotoDeclarationShortcut, editor.contentComponent, this)
+        editor.addEditorMouseListener(navigateMouseListener, this)
+    }
+
+    private fun uninstallNavigationSupport() {
+        navigationEditor?.let { navigateFromDiffAction.unregisterCustomShortcutSet(it.contentComponent) }
+        navigationEditor = null
+    }
+
+    private fun navigateFromDiffCaret(): Boolean {
+        val editor = navigationEditor ?: currentRightEditor() ?: return false
+        val offset = editor.caretModel.offset.coerceAtLeast(0)
+        val line = editor.document.getLineNumber(offset)
+        val column = offset - editor.document.getLineStartOffset(line)
+        return navigateFromDiffOffset(editor, line, column)
+    }
+
+    private fun navigateFromDiffOffset(editor: EditorEx?, line: Int, column: Int): Boolean {
+        val change = currentChange() ?: return false
+        val referent = ProjectFiles.find(project, change.newPath ?: change.oldPath ?: return false) ?: return false
+        val actualEditor = FileEditorManager.getInstance(project)
+            .openTextEditor(OpenFileDescriptor(project, referent, line.coerceAtLeast(0), column.coerceAtLeast(0)).setUsePreviewTab(true), false)
+            ?: return false
+
+        PsiDocumentManager.getInstance(project).commitAllDocuments()
+
+        val safeLine = line.coerceIn(0, actualEditor.document.lineCount - 1)
+        val lineStart = actualEditor.document.getLineStartOffset(safeLine)
+        val lineEnd = actualEditor.document.getLineEndOffset(safeLine)
+        val targetOffset = (lineStart + column).coerceIn(lineStart, lineEnd)
+
+        val targets = GotoDeclarationAction.findAllTargetElements(project, actualEditor, targetOffset)
+        if (targets.isEmpty()) {
+            return false
+        }
+
+        PsiNavigateUtil.navigate(targets.first(), true)
+        return true
+    }
+
+    private fun matchesFilter(change: MrReviewChange, query: String): Boolean {
+        if (query.isBlank()) return true
+        val path = change.displayPath().lowercase()
+        val name = path.substringAfterLast('/')
+        return query in path || query in name
+    }
+
+    private fun matchesChange(comment: ReviewComment, change: MrReviewChange): Boolean {
+        val commentCandidates = linkedSetOf<String>()
+        comment.diffNewPath?.let(commentCandidates::add)
+        comment.diffOldPath?.let(commentCandidates::add)
+        commentCandidates.add(comment.file)
+        return change.newPath in commentCandidates || change.oldPath in commentCandidates
+    }
+
+    private fun tooltipFor(comment: ReviewComment): String =
+        "[${comment.startLine}-${comment.endLine}] ${comment.comment}"
+
+    private fun rangeAttributes(selected: Boolean): TextAttributes {
+        val scheme = EditorColorsManager.getInstance().globalScheme
+        val accent = scheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR) ?: UIUtil.getFocusedFillColor()
+        val background = mix(scheme.defaultBackground ?: UIUtil.getEditorPaneBackground(), accent, if (selected) 0.42f else 0.14f)
+        return TextAttributes().apply {
+            backgroundColor = background
+            if (selected) {
+                effectType = EffectType.BOXED
+                effectColor = accent
+            }
+        }
+    }
+
+    private fun mix(base: Color, accent: Color, weight: Float): Color {
+        val normalized = weight.coerceIn(0f, 1f)
+        val inverse = 1f - normalized
+        return Color(
+            (base.red * inverse + accent.red * normalized).toInt().coerceIn(0, 255),
+            (base.green * inverse + accent.green * normalized).toInt().coerceIn(0, 255),
+            (base.blue * inverse + accent.blue * normalized).toInt().coerceIn(0, 255)
+        )
+    }
+
+    private sealed interface TreeEntry {
+        data object Root : TreeEntry
+        data class Directory(val name: String, val path: String) : TreeEntry
+        data class File(val index: Int, val change: MrReviewChange) : TreeEntry
+    }
+
+    private data class State(val selectedChangeIndex: Int) : FileEditorState {
+        override fun canBeMergedWith(otherState: FileEditorState, level: FileEditorStateLevel): Boolean =
+            otherState is State && otherState.selectedChangeIndex == selectedChangeIndex
+    }
+
+    private inner class ChangeTreeRenderer : ColoredTreeCellRenderer() {
+        private val positive = Color(0x3FA76A)
+        private val negative = Color(0xD05B5B)
+
+        override fun customizeCellRenderer(
+            tree: javax.swing.JTree,
+            value: Any?,
+            selected: Boolean,
+            expanded: Boolean,
+            leaf: Boolean,
+            row: Int,
+            hasFocus: Boolean
+        ) {
+            border = JBUI.Borders.empty(2, 4)
+            val node = (value as? DefaultMutableTreeNode)?.userObject as? TreeEntry ?: return
+            when (node) {
+                TreeEntry.Root -> Unit
+                is TreeEntry.Directory -> {
+                    icon = if (expanded) AllIcons.Nodes.Folder else AllIcons.Nodes.Folder
+                    append(node.name, SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                }
+                is TreeEntry.File -> {
+                    val change = node.change
+                    val path = change.displayPath()
+                    val fileName = path.substringAfterLast('/')
+                    val parent = path.substringBeforeLast('/', "")
+                    icon = fileIcon(fileName)
+                    append(fileName, SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                    if (change.addedLines > 0 || change.removedLines > 0) {
+                        append("  ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                        append("+${change.addedLines}", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, positive))
+                        append(" ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                        append("-${change.removedLines}", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, negative))
+                    }
+                    append("  ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
+                    append(change.statusLetter(), SimpleTextAttributes.GRAYED_ATTRIBUTES)
+                    if (parent.isNotBlank()) {
+                        append(" • $parent", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
+                    }
+                }
+            }
+        }
+    }
+
+    private class CommentGutterRenderer(
+        private val project: Project,
+        private val icon: javax.swing.Icon,
+        private val comments: List<ReviewComment>
+    ) : GutterIconRenderer() {
+
+        override fun getIcon(): javax.swing.Icon = icon
+
+        override fun getTooltipText(): String =
+            comments.joinToString("\n") { "[${it.startLine}-${it.endLine}] ${it.comment}" }
+
+        override fun getAlignment(): Alignment = Alignment.LEFT
+
+        override fun getClickAction(): AnAction = object : AnAction() {
+            override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+            override fun actionPerformed(e: AnActionEvent) {
+                val first = comments.firstOrNull() ?: return
+                CommentToolWindowService.getInstance(project).showComment(first.id)
+            }
+        }
+
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is CommentGutterRenderer) return false
+            return comments.map { it.id } == other.comments.map { it.id }
+        }
+
+        override fun hashCode(): Int = comments.map { it.id }.hashCode()
+    }
+
+    private fun fileIcon(fileName: String) =
+        com.intellij.openapi.fileTypes.FileTypeManager.getInstance().getFileTypeByFileName(fileName).icon ?: AllIcons.FileTypes.Any_type
+
+    private fun MrReviewChange.displayPath(): String =
+        newPath ?: oldPath ?: "unknown"
+
+    private fun MrReviewChange.statusLetter(): String =
+        when {
+            status.startsWith("A") -> "A"
+            status.startsWith("D") -> "D"
+            status.startsWith("R") -> "R"
+            status.startsWith("C") -> "C"
+            else -> "M"
+        }
+}

@@ -17,8 +17,15 @@ repositories {
 }
 
 dependencies {
+    val localPlatformPath = providers.gradleProperty("localPlatformPath")
+
     intellijPlatform {
-        goland(providers.gradleProperty("platformVersion"))
+        if (localPlatformPath.isPresent) {
+            local(localPlatformPath)
+        } else {
+            goland(providers.gradleProperty("platformVersion"), false)
+        }
+        bundledPlugin("org.jetbrains.plugins.go")
         bundledPlugin("Git4Idea")
         bundledModule("intellij.platform.vcs.dvcs.impl")
         instrumentationTools()
@@ -37,7 +44,7 @@ intellijPlatform {
         version = providers.gradleProperty("pluginVersion")
 
         ideaVersion {
-            sinceBuild = "242"
+            sinceBuild = "253"
             untilBuild = "253.*"
         }
     }

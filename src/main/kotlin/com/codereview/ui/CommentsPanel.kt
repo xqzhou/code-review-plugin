@@ -1,10 +1,13 @@
 package com.codereview.ui
 
+import com.codereview.editor.CommentEditorDecorations
 import com.codereview.git.GitUserProvider
 import com.codereview.model.CommentDraft
 import com.codereview.model.ReviewComment
+import com.codereview.model.ReviewThread
 import com.codereview.service.CommentSelectionService
 import com.codereview.service.CommentService
+import com.codereview.service.MrReviewService
 import com.codereview.util.ProjectFiles
 import com.intellij.icons.AllIcons
 import com.intellij.openapi.actionSystem.ActionManager
@@ -16,6 +19,7 @@ import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.editor.colors.EditorColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
+import com.intellij.openapi.components.service
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.openapi.ide.CopyPasteManager
@@ -36,16 +40,13 @@ import java.awt.Color
 import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
-import java.awt.FlowLayout
 import java.awt.Font
-import java.awt.MouseInfo
 import java.awt.datatransfer.StringSelection
 import java.awt.event.MouseAdapter
 import java.awt.event.MouseEvent
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
-import javax.swing.Timer
 import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
@@ -54,15 +55,15 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.JTextArea
 import javax.swing.SwingUtilities
+import javax.swing.Timer
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 
 class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
-
-    private var comments: List<ReviewComment> = emptyList()
+    private var threads: List<ReviewThread> = emptyList()
     private var editingState: InlineEditState? = null
-    private val cardViews = linkedMapOf<String, CommentCardView>()
-    private var transientDraftCard: CommentCardView? = null
+    private val threadViews = linkedMapOf<String, ThreadCardView>()
+    private var transientDraftCard: ThreadCardView? = null
     private var flashingCommentId: String? = null
     private var flashOn = false
     private var flashTimer: Timer? = null
@@ -83,8 +84,8 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     init {
-        val toolbar = buildToolbar()
-        add(toolbar.component, BorderLayout.NORTH)
+        project.service<CommentEditorDecorations>()
+        add(buildToolbar().component, BorderLayout.NORTH)
         add(buildCommentsArea(), BorderLayout.CENTER)
 
         val connection = project.messageBus.connect()
@@ -104,6 +105,12 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun buildToolbar(): ActionToolbar {
         val group = DefaultActionGroup().apply {
+            add(object : AnAction("Open MR Diff", "Open the MR diff review for the current branch", null) {
+                override fun getActionUpdateThread() = ActionUpdateThread.BGT
+                override fun actionPerformed(e: AnActionEvent) {
+                    MrReviewService.getInstance(project).openReview()
+                }
+            })
             add(object : AnAction("Refresh", "Reload comments from disk", AllIcons.Actions.Refresh) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
                 override fun actionPerformed(e: AnActionEvent) = refresh()
@@ -132,7 +139,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     fun beginDraft(draft: CommentDraft) {
         finishActiveEditBefore {
-            editingState = InlineEditState.New(draft = draft, text = draft.initialComment)
+            editingState = InlineEditState.NewThread(draft, draft.initialComment)
             CommentSelectionService.getInstance(project).select(null)
             renderCards()
             scrollToTransientDraft()
@@ -140,13 +147,6 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     fun beginEdit(commentId: String) {
-        val current = editingState
-        if (current is InlineEditState.Existing && current.commentId == commentId) {
-            scrollToComment(commentId)
-            focusActiveEditor()
-            return
-        }
-
         val comment = CommentService.getInstance(project).find(commentId) ?: run {
             CommentNotifications.warn(project, "Comment Not Found", "The selected comment no longer exists on this branch.")
             refresh()
@@ -154,19 +154,25 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
         if (!canModify(comment)) {
             CommentNotifications.warn(project, "Comment Is Read-Only", "Only comments created by you can be edited or deleted.")
-            selectComment(comment.id)
+            selectComment(commentId)
             return
         }
-
+        val current = editingState
+        if (current is InlineEditState.EditComment && current.commentId == commentId) {
+            scrollToComment(commentId)
+            focusActiveEditor()
+            return
+        }
         finishActiveEditBefore {
-            editingState = InlineEditState.Existing(
-                commentId = comment.id,
-                originalText = comment.comment,
-                text = comment.comment
+            editingState = InlineEditState.EditComment(
+                threadId = comment.threadId,
+                commentId = commentId,
+                originalText = comment.content,
+                text = comment.content
             )
-            CommentSelectionService.getInstance(project).select(comment.id)
+            CommentSelectionService.getInstance(project).select(commentId)
             renderCards()
-            scrollToComment(comment.id)
+            scrollToComment(commentId)
             focusActiveEditor()
         }
     }
@@ -176,23 +182,22 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         scrollToComment(commentId)
     }
 
-    private fun selected(): ReviewComment? {
-        val selectedId = CommentSelectionService.getInstance(project).currentSelection() ?: return null
-        return comments.firstOrNull { it.id == selectedId }
-    }
-
     fun refresh() {
-        comments = CommentService.getInstance(project).all().sortedWith(
-            compareByDescending<ReviewComment> { it.updatedAt }.thenBy { it.file }.thenBy { it.startLine }
+        val service = CommentService.getInstance(project)
+        threads = service.allThreads().sortedWith(
+            compareByDescending<ReviewThread> { it.updatedAt }.thenBy { it.file }.thenBy { it.startLine }
         )
 
         val selectedId = CommentSelectionService.getInstance(project).currentSelection()
-        if (selectedId != null && comments.none { it.id == selectedId }) {
+        if (selectedId != null && service.find(selectedId) == null) {
             CommentSelectionService.getInstance(project).select(null)
         }
 
-        val currentEdit = editingState
-        if (currentEdit is InlineEditState.Existing && comments.none { it.id == currentEdit.commentId }) {
+        val active = editingState
+        if (active is InlineEditState.EditComment && service.find(active.commentId) == null) {
+            editingState = null
+        }
+        if (active is InlineEditState.Reply && service.findThread(active.threadId) == null) {
             editingState = null
         }
 
@@ -200,32 +205,25 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun renderCards() {
-        cardViews.clear()
+        threadViews.clear()
         transientDraftCard = null
         cardsContainer.removeAll()
 
         val activeEdit = editingState
-        if (activeEdit is InlineEditState.New) {
-            transientDraftCard = createEditingCard(activeEdit)
+        if (activeEdit is InlineEditState.NewThread) {
+            transientDraftCard = createDraftCard(activeEdit)
             cardsContainer.add(transientDraftCard!!.root)
-            if (comments.isNotEmpty()) {
-                cardsContainer.add(Box.createVerticalStrut(JBUI.scale(8)))
-            }
+            if (threads.isNotEmpty()) cardsContainer.add(Box.createVerticalStrut(JBUI.scale(8)))
         }
 
-        if (comments.isEmpty() && activeEdit !is InlineEditState.New) {
+        if (threads.isEmpty() && activeEdit !is InlineEditState.NewThread) {
             cardsContainer.add(emptyState)
         } else {
-            comments.forEachIndexed { index, comment ->
-                val cardView = when {
-                    activeEdit is InlineEditState.Existing && activeEdit.commentId == comment.id ->
-                        createEditingCard(comment, activeEdit)
-                    else ->
-                        createReadOnlyCard(comment)
-                }
-                cardViews[comment.id] = cardView
-                cardsContainer.add(cardView.root)
-                if (index != comments.lastIndex) {
+            threads.forEachIndexed { index, thread ->
+                val card = createThreadCard(thread)
+                threadViews[thread.id] = card
+                cardsContainer.add(card.root)
+                if (index != threads.lastIndex) {
                     cardsContainer.add(Box.createVerticalStrut(JBUI.scale(8)))
                 }
             }
@@ -234,143 +232,170 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         cardsContainer.revalidate()
         cardsContainer.repaint()
         scrollToComment(CommentSelectionService.getInstance(project).currentSelection())
-        if (activeEdit is InlineEditState.New) {
-            scrollToTransientDraft()
-        }
+        if (activeEdit is InlineEditState.NewThread) scrollToTransientDraft()
     }
 
-    private fun createReadOnlyCard(comment: ReviewComment): CommentCardView {
-        val editable = canModify(comment)
-        val titleLabel = JBLabel(fileNameOf(comment.file)).apply {
-            foreground = UIUtil.getLabelForeground()
-            font = uiFont(11f, bold = true)
-            toolTipText = comment.file
-            alignmentX = Component.LEFT_ALIGNMENT
-        }
-        val locationLabel = JBLabel(buildLocationLabel(comment.file, lineRange(comment))).apply {
-            foreground = UIUtil.getContextHelpForeground()
-            font = uiFont(10f)
-            toolTipText = "${comment.file}:${lineRange(comment)}"
-            alignmentX = Component.LEFT_ALIGNMENT
-        }
-        val infoRow = buildInfoRow(comment)
-        val body = JBTextArea(comment.comment).apply {
-            isEditable = false
-            isOpaque = false
-            lineWrap = true
-            wrapStyleWord = true
-            border = null
-            font = bodyFont()
-            foreground = UIUtil.getLabelForeground()
-            cursor = Cursor.getPredefinedCursor(Cursor.DEFAULT_CURSOR)
-            alignmentX = Component.LEFT_ALIGNMENT
-        }
-
-        val actions = JPanel(HorizontalLayout(JBUI.scale(12))).apply {
-            isOpaque = false
-            if (editable) {
-                add(cardActionLink("Edit") { beginEdit(comment.id) })
-                add(cardActionLink("Delete") { deleteComment(comment) })
-            }
-        }
-        val actionSlot = JBPanel<JBPanel<*>>(BorderLayout()).apply {
-            isOpaque = false
-            preferredSize = Dimension(0, JBUI.scale(26))
-            minimumSize = Dimension(0, JBUI.scale(26))
-            add(actions, BorderLayout.WEST)
-        }
-
-        val header = JBPanel<JBPanel<*>>().apply {
+    private fun createDraftCard(editState: InlineEditState.NewThread): ThreadCardView {
+        val titleLabel = headerTitle(fileNameOf(editState.draft.file), editState.draft.file)
+        val locationLabel = locationLabel(editState.draft.file, lineRange(editState.draft.startLine, editState.draft.endLine))
+        val infoRow = metaOnlyRow("Local draft")
+        val content = JBPanel<JBPanel<*>>().apply {
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
-            alignmentX = Component.LEFT_ALIGNMENT
             add(titleLabel)
             add(Box.createVerticalStrut(JBUI.scale(2)))
             add(locationLabel)
             add(Box.createVerticalStrut(JBUI.scale(4)))
             add(infoRow)
+            add(Box.createVerticalStrut(JBUI.scale(10)))
+            add(editorBlock(
+                initialText = editState.text,
+                placeholder = "New comment",
+                onTextChanged = { updated -> editState.text = updated },
+                onSave = { saveNewThread(editState) },
+                onCancel = { cancelEditing() }
+            ))
         }
+        return wrapCard(
+            threadId = "__draft__",
+            content = content,
+            isSelected = true,
+            isFlashing = false,
+            onOpen = { navigateToDraft(editState.draft) }
+        )
+    }
 
-        val content = JBPanel<JBPanel<*>>(BorderLayout(0, 10)).apply {
+    private fun createThreadCard(thread: ReviewThread): ThreadCardView {
+        val rootComment = rootComment(thread) ?: return wrapCard(
+            threadId = thread.id,
+            content = JBLabel("Empty thread"),
+            isSelected = false,
+            isFlashing = false,
+            onOpen = {}
+        )
+        val selectedCommentId = CommentSelectionService.getInstance(project).currentSelection()
+        val isSelected = thread.comments.any { it.id == selectedCommentId }
+        val isFlashing = flashOn && thread.comments.any { it.id == flashingCommentId }
+
+        val content = JBPanel<JBPanel<*>>().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
-            add(header, BorderLayout.NORTH)
-            add(body, BorderLayout.CENTER)
-            add(actionSlot, BorderLayout.SOUTH)
+            add(headerTitle(fileNameOf(thread.file), thread.file))
+            add(Box.createVerticalStrut(JBUI.scale(2)))
+            add(locationLabel(thread.file, lineRange(thread.startLine, thread.endLine)))
+            add(Box.createVerticalStrut(JBUI.scale(4)))
+            add(threadInfoRow(thread))
+            add(Box.createVerticalStrut(JBUI.scale(10)))
         }
 
-        val cardView = wrapCard(content, showActionsOnHover = true, actionContent = actions, commentId = comment.id)
-        applyCardStyle(cardView, isSelected = comment.id == CommentSelectionService.getInstance(project).currentSelection())
-        val clickListener = createReadOnlyCardMouseListener(cardView, comment)
-        installCardMouseTargets(cardView, clickListener, listOf(content, header, titleLabel, locationLabel, infoRow, body, actionSlot))
-        actions.components.forEach { installHoverMouseTarget(it, clickListener) }
-        return cardView
-    }
+        thread.comments.forEach { comment ->
+            content.add(createCommentBlock(thread, comment))
+            content.add(Box.createVerticalStrut(JBUI.scale(8)))
+        }
 
-    private fun createEditingCard(editState: InlineEditState.New): CommentCardView {
-        val titleLabel = JBLabel(fileNameOf(editState.draft.file)).apply {
-            foreground = UIUtil.getLabelForeground()
-            font = uiFont(11f, bold = true)
-            toolTipText = editState.draft.file
-            alignmentX = Component.LEFT_ALIGNMENT
+        if (thread.outdated) {
+            content.add(statusRowLabel("This thread is outdated in the current diff."))
+            content.add(Box.createVerticalStrut(JBUI.scale(8)))
         }
-        val locationLabel = JBLabel(buildLocationLabel(editState.draft.file, lineRange(editState.draft.startLine, editState.draft.endLine))).apply {
-            foreground = UIUtil.getContextHelpForeground()
-            font = uiFont(10f)
-            alignmentX = Component.LEFT_ALIGNMENT
+
+        if (editingState is InlineEditState.Reply && (editingState as InlineEditState.Reply).threadId == thread.id) {
+            val state = editingState as InlineEditState.Reply
+            content.add(editorBlock(
+                initialText = state.text,
+                placeholder = "Reply",
+                onTextChanged = { updated -> state.text = updated },
+                onSave = { saveReply(state) },
+                onCancel = { cancelEditing() }
+            ))
+            content.add(Box.createVerticalStrut(JBUI.scale(8)))
         }
-        val infoRow = buildMetaOnlyRow("Local draft")
-        return createEditingCardShell(
-            titleLabel = titleLabel,
-            locationLabel = locationLabel,
-            infoRow = infoRow,
-            text = editState.text,
-            isSaveEnabled = editState.text.trim().isNotEmpty(),
-            onTextChanged = { editState.text = it },
-            onSave = { saveNewDraft(editState) },
-            onCancel = { cancelEditing() },
-            onNavigate = { navigateToDraft(editState.draft) }
+
+        content.add(threadActions(thread))
+
+        return wrapCard(
+            threadId = thread.id,
+            content = content,
+            isSelected = isSelected,
+            isFlashing = isFlashing,
+            onOpen = {
+                selectComment(selectedCommentId.takeIf { id -> thread.comments.any { it.id == id } } ?: rootComment.id)
+                navigateTo(rootComment, requestFocusComment = false)
+            },
+            onDoubleOpen = {
+                if (canModify(rootComment)) beginEdit(rootComment.id)
+            }
         )
     }
 
-    private fun createEditingCard(comment: ReviewComment, editState: InlineEditState.Existing): CommentCardView {
-        val titleLabel = JBLabel(fileNameOf(comment.file)).apply {
-            foreground = UIUtil.getLabelForeground()
-            font = uiFont(11f, bold = true)
-            toolTipText = comment.file
+    private fun createCommentBlock(thread: ReviewThread, comment: ReviewComment): JComponent {
+        val isEditing = editingState is InlineEditState.EditComment &&
+            (editingState as InlineEditState.EditComment).commentId == comment.id
+        val canModify = canModify(comment)
+
+        val block = JBPanel<JBPanel<*>>().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
         }
-        val locationLabel = JBLabel(buildLocationLabel(comment.file, lineRange(comment))).apply {
-            foreground = UIUtil.getContextHelpForeground()
-            font = uiFont(10f)
-            toolTipText = "${comment.file}:${lineRange(comment)}"
+
+        val meta = JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(8))).apply {
+            isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
+            add(JBLabel(buildCommentMeta(comment)).apply {
+                foreground = UIUtil.getContextHelpForeground()
+                font = uiFont(10f)
+            })
+            if (canModify) {
+                add(commentAction("Edit") { beginEdit(comment.id) })
+                add(commentAction("Delete") { deleteComment(comment) })
+            }
         }
-        val infoRow = buildInfoRow(comment)
-        return createEditingCardShell(
-            titleLabel = titleLabel,
-            locationLabel = locationLabel,
-            infoRow = infoRow,
-            text = editState.text,
-            isSaveEnabled = editState.text.trim().isNotEmpty() && editState.text != editState.originalText,
-            onTextChanged = { editState.text = it },
-            onSave = { saveExistingEdit(editState) },
-            onCancel = { cancelEditing() },
-            onNavigate = { navigateTo(comment, requestFocusComment = true) }
-        )
+        block.add(meta)
+        block.add(Box.createVerticalStrut(JBUI.scale(4)))
+
+        if (isEditing) {
+            val state = editingState as InlineEditState.EditComment
+            block.add(editorBlock(
+                initialText = state.text,
+                placeholder = "Edit comment",
+                onTextChanged = { updated -> state.text = updated },
+                onSave = { saveExistingEdit(state) },
+                onCancel = { cancelEditing() }
+            ))
+        } else {
+            block.add(JBTextArea(comment.content).apply {
+                isEditable = false
+                isOpaque = false
+                lineWrap = true
+                wrapStyleWord = true
+                border = null
+                font = bodyFont()
+                foreground = UIUtil.getLabelForeground()
+                alignmentX = Component.LEFT_ALIGNMENT
+            })
+        }
+
+        val clickTarget = object : MouseAdapter() {
+            override fun mouseClicked(e: MouseEvent) {
+                if (!SwingUtilities.isLeftMouseButton(e)) return
+                selectComment(comment.id)
+                navigateTo(comment, requestFocusComment = false)
+                if (e.clickCount == 2 && canModify) beginEdit(comment.id)
+            }
+        }
+        markClickOwned(block)
+        installClickTarget(block, clickTarget)
+        return block
     }
 
-    private fun createEditingCardShell(
-        titleLabel: JBLabel,
-        locationLabel: JBLabel,
-        infoRow: JComponent,
-        text: String,
-        isSaveEnabled: Boolean,
+    private fun editorBlock(
+        initialText: String,
+        placeholder: String,
         onTextChanged: (String) -> Unit,
         onSave: () -> Unit,
-        onCancel: () -> Unit,
-        onNavigate: () -> Unit
-    ): CommentCardView {
-        val editor = JBTextArea(text).apply {
+        onCancel: () -> Unit
+    ): JComponent {
+        val editor = JBTextArea(initialText).apply {
             lineWrap = true
             wrapStyleWord = true
             font = bodyFont()
@@ -378,16 +403,11 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             background = UIUtil.getPanelBackground()
             border = JBUI.Borders.empty(8)
             rows = 4
-            cursor = Cursor.getPredefinedCursor(Cursor.TEXT_CURSOR)
             alignmentX = Component.LEFT_ALIGNMENT
+            toolTipText = placeholder
         }
-        val saveButton = JButton("Save").apply {
-            isEnabled = isSaveEnabled
-            addActionListener { onSave() }
-        }
-        val cancelButton = JButton("Cancel").apply {
-            addActionListener { onCancel() }
-        }
+        val saveButton = JButton("Save")
+        val cancelButton = JButton("Cancel")
 
         editor.document.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent) = update()
@@ -398,67 +418,124 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
                 saveButton.isEnabled = editor.text.trim().isNotEmpty()
             }
         })
+        saveButton.isEnabled = initialText.trim().isNotEmpty()
+        saveButton.addActionListener { onSave() }
+        cancelButton.addActionListener { onCancel() }
 
-        val header = JBPanel<JBPanel<*>>().apply {
-            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+        return JBPanel<JBPanel<*>>(BorderLayout(0, 8)).apply {
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
-            add(titleLabel)
-            add(Box.createVerticalStrut(JBUI.scale(2)))
-            add(locationLabel)
-            add(Box.createVerticalStrut(JBUI.scale(4)))
-            add(infoRow)
-        }
-        val buttonRow = JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(8), 0)).apply {
-            isOpaque = false
-            add(saveButton)
-            add(cancelButton)
-        }
-        val footer = JBPanel<JBPanel<*>>(BorderLayout()).apply {
-            isOpaque = false
-            preferredSize = Dimension(0, JBUI.scale(32))
-            minimumSize = Dimension(0, JBUI.scale(32))
-            add(buttonRow, BorderLayout.WEST)
-        }
-        val content = JBPanel<JBPanel<*>>(BorderLayout(0, 10)).apply {
-            isOpaque = false
-            add(header, BorderLayout.NORTH)
             add(JBScrollPane(editor).apply {
                 border = JBUI.Borders.customLine(JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground())
                 preferredSize = Dimension(0, JBUI.scale(120))
             }, BorderLayout.CENTER)
-            add(footer, BorderLayout.SOUTH)
+            add(JPanel(HorizontalLayout(JBUI.scale(8))).apply {
+                isOpaque = false
+                add(saveButton)
+                add(cancelButton)
+            }, BorderLayout.SOUTH)
         }
+    }
 
-        val cardView = wrapCard(
-            content,
-            showActionsOnHover = false,
-            actionContent = null,
-            commentId = (editingState as? InlineEditState.Existing)?.commentId
-        )
-        applyCardStyle(cardView, isSelected = true)
-
-        val navigateListener = object : MouseAdapter() {
-            override fun mouseClicked(e: MouseEvent) {
-                if (SwingUtilities.isLeftMouseButton(e) && e.clickCount == 1) {
-                    onNavigate()
-                }
+    private fun threadActions(thread: ReviewThread): JComponent =
+        JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(12))).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(cardAction("Reply") { beginReply(thread.id) })
+            add(cardAction(if (thread.status == "resolved") "Reopen" else "Resolve") { toggleResolved(thread) })
+            if (canDeleteThread(thread)) {
+                add(cardAction("Delete") { deleteThread(thread) })
             }
         }
-        listOf(titleLabel, locationLabel, infoRow).forEach { installHoverMouseTarget(it, navigateListener) }
-        SwingUtilities.invokeLater {
-            editor.requestFocusInWindow()
-            editor.caretPosition = editor.text.length
+
+    private fun headerTitle(text: String, tooltip: String): JBLabel =
+        JBLabel(text).apply {
+            foreground = UIUtil.getLabelForeground()
+            font = uiFont(11f, bold = true)
+            toolTipText = tooltip
+            alignmentX = Component.LEFT_ALIGNMENT
         }
-        return cardView
+
+    private fun locationLabel(path: String, lines: String): JBLabel =
+        JBLabel(buildLocationLabel(path, lines)).apply {
+            foreground = UIUtil.getContextHelpForeground()
+            font = uiFont(10f)
+            toolTipText = "$path:$lines"
+            alignmentX = Component.LEFT_ALIGNMENT
+        }
+
+    private fun threadInfoRow(thread: ReviewThread): JComponent {
+        val row = JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(8))).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            syncStatusBadge(thread.syncStatus)?.let(::add)
+            if (thread.status == "resolved") {
+                add(infoBadge("Resolved", Color(0x5E9E78)))
+            }
+            if (thread.outdated) {
+                add(infoBadge("Outdated", Color(0xC9913A)))
+            }
+            thread.findingId?.takeIf { it.isNotBlank() }?.let { add(infoBadge(it, Color(0x6B8AD1))) }
+        }
+        return row
+    }
+
+    private fun metaOnlyRow(text: String): JComponent =
+        JBPanel<JBPanel<*>>(HorizontalLayout(0)).apply {
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(statusRowLabel(text))
+        }
+
+    private fun statusRowLabel(text: String): JBLabel =
+        JBLabel(text).apply {
+            foreground = UIUtil.getContextHelpForeground()
+            font = uiFont(10f)
+            alignmentX = Component.LEFT_ALIGNMENT
+        }
+
+    private fun syncStatusBadge(syncStatus: String): JComponent? {
+        val label = when (syncStatus) {
+            "local_only" -> "Local"
+            "modified" -> "Modified"
+            "delete_pending" -> "Delete pending"
+            "synced" -> "Synced"
+            else -> syncStatus.takeIf { it.isNotBlank() }?.replace('_', ' ')
+        } ?: return null
+        val accent = EditorColorsManager.getInstance().globalScheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR)
+            ?: UIUtil.getFocusedFillColor()
+        val tone = when (syncStatus) {
+            "delete_pending" -> Color(0xD06565)
+            "modified" -> Color(0xC9913A)
+            "synced" -> Color(0x5E9E78)
+            else -> mix(accent, Color(0x7F8FA6), 0.55f)
+        }
+        return infoBadge(label, tone)
+    }
+
+    private fun infoBadge(text: String, tone: Color): JComponent {
+        val foreground = mix(UIUtil.getLabelForeground(), tone, 0.42f)
+        val background = mix(UIUtil.getPanelBackground(), tone, 0.08f)
+        return JBLabel(text).apply {
+            font = uiFont(10f)
+            this.foreground = foreground
+            isOpaque = true
+            this.background = background
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(mix(background, tone, 0.22f), 1),
+                JBUI.Borders.empty(1, 6)
+            )
+        }
     }
 
     private fun wrapCard(
+        threadId: String,
         content: JComponent,
-        showActionsOnHover: Boolean,
-        actionContent: JComponent?,
-        commentId: String?
-    ): CommentCardView {
+        isSelected: Boolean,
+        isFlashing: Boolean,
+        onOpen: () -> Unit,
+        onDoubleOpen: (() -> Unit)? = null
+    ): ThreadCardView {
         val stripe = JBPanel<JBPanel<*>>().apply {
             preferredSize = Dimension(JBUI.scale(4), 0)
             minimumSize = Dimension(JBUI.scale(4), 0)
@@ -467,6 +544,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         val root = object : JBPanel<JBPanel<*>>(BorderLayout()) {
             override fun getMaximumSize(): Dimension = Dimension(Int.MAX_VALUE, preferredSize.height)
         }.apply {
+            isOpaque = true
             add(stripe, BorderLayout.WEST)
             add(JBPanel<JBPanel<*>>(BorderLayout()).apply {
                 isOpaque = false
@@ -475,102 +553,59 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             }, BorderLayout.CENTER)
             alignmentX = Component.LEFT_ALIGNMENT
         }
-        return CommentCardView(
-            root = root,
-            stripe = stripe,
-            hoverActionContent = actionContent,
-            showActionsOnHover = showActionsOnHover,
-            commentId = commentId
-        )
-    }
-
-    private fun createReadOnlyCardMouseListener(cardView: CommentCardView, comment: ReviewComment): MouseAdapter =
-        object : MouseAdapter() {
+        val view = ThreadCardView(root, stripe, threadId)
+        applyCardStyle(view, isSelected, isFlashing)
+        val listener = object : MouseAdapter() {
             override fun mouseClicked(e: MouseEvent) {
                 if (!SwingUtilities.isLeftMouseButton(e)) return
-                navigateTo(comment, requestFocusComment = true)
+                onOpen()
                 if (e.clickCount == 2) {
-                    beginEdit(comment.id)
-                }
-            }
-
-            override fun mouseEntered(e: MouseEvent) {
-                cardView.hovered = true
-                applyCardStyle(cardView, comment.id == CommentSelectionService.getInstance(project).currentSelection())
-            }
-
-            override fun mouseExited(e: MouseEvent) {
-                SwingUtilities.invokeLater {
-                    val pointer = MouseInfo.getPointerInfo()?.location ?: return@invokeLater
-                    val point = pointer.location
-                    SwingUtilities.convertPointFromScreen(point, cardView.root)
-                    cardView.hovered = cardView.root.isShowing && cardView.root.contains(point)
-                    applyCardStyle(cardView, comment.id == CommentSelectionService.getInstance(project).currentSelection())
+                    onDoubleOpen?.invoke()
                 }
             }
         }
-
-    private fun installCardMouseTargets(cardView: CommentCardView, listener: MouseAdapter, components: List<Component>) {
-        installHoverMouseTarget(cardView.root, listener)
-        components.forEach { installHoverMouseTarget(it, listener) }
-        cardView.hoverActionContent?.let { installHoverMouseTarget(it, listener) }
+        installClickTarget(root, listener, skipOwnedSubtrees = true)
+        return view
     }
 
-    private fun installHoverMouseTarget(component: Component, listener: MouseAdapter) {
-        component.addMouseListener(listener)
-        if (component is JComponent) {
-            component.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
-        }
-    }
-
-    private fun applyCardStyle(cardView: CommentCardView, isSelected: Boolean) {
+    private fun applyCardStyle(view: ThreadCardView, isSelected: Boolean, isFlashing: Boolean) {
         val base = UIUtil.getPanelBackground()
         val accent = EditorColorsManager.getInstance().globalScheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR)
             ?: UIUtil.getFocusedFillColor()
-        val isFlashing = flashOn && cardView.commentId != null && cardView.commentId == flashingCommentId
         val background = when {
             isFlashing -> mix(base, accent, 0.16f)
             isSelected -> mix(base, accent, 0.10f)
-            cardView.hovered -> mix(base, accent, 0.04f)
             else -> elevate(base, 0.035f)
         }
         val borderColor = when {
             isFlashing -> accent
             isSelected -> mix(base, accent, 0.60f)
-            cardView.hovered -> mix(base, accent, 0.18f)
             else -> JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()
         }
-
-        cardView.root.background = background
-        cardView.root.isOpaque = true
-        cardView.root.border = BorderFactory.createCompoundBorder(
+        view.root.background = background
+        view.root.border = BorderFactory.createCompoundBorder(
             JBUI.Borders.customLine(borderColor, if (isSelected || isFlashing) 2 else 1),
             JBUI.Borders.empty()
         )
-        cardView.stripe.background = when {
-            isFlashing -> accent
-            isSelected -> accent
-            cardView.hovered -> mix(base, accent, 0.28f)
-            else -> mix(base, borderColor, 0.14f)
-        }
-        cardView.stripe.isOpaque = true
-
-        if (cardView.showActionsOnHover) {
-            cardView.hoverActionContent?.isVisible = cardView.hovered
-        }
+        view.stripe.background = if (isSelected || isFlashing) accent else mix(base, borderColor, 0.14f)
+        view.stripe.isOpaque = true
     }
 
     private fun syncCardSelection(commentId: String?) {
-        cardViews.forEach { (id, cardView) ->
-            applyCardStyle(cardView, isSelected = id == commentId)
+        threadViews.forEach { (threadId, view) ->
+            val thread = threads.firstOrNull { it.id == threadId }
+            val isSelected = thread?.comments?.any { it.id == commentId } == true
+            val isFlashing = flashOn && thread?.comments?.any { it.id == flashingCommentId } == true
+            applyCardStyle(view, isSelected, isFlashing)
         }
-        transientDraftCard?.let { applyCardStyle(it, isSelected = editingState is InlineEditState.New) }
+        transientDraftCard?.let { applyCardStyle(it, editingState is InlineEditState.NewThread, false) }
         scrollToComment(commentId)
     }
 
     private fun scrollToComment(commentId: String?) {
         if (commentId == null) return
-        val card = cardViews[commentId]?.root ?: return
+        val threadId = CommentService.getInstance(project).findThreadByCommentId(commentId)?.id ?: return
+        val card = threadViews[threadId]?.root ?: return
         SwingUtilities.invokeLater {
             cardsContainer.scrollRectToVisible(card.bounds)
         }
@@ -584,11 +619,15 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun focusActiveEditor() {
-        val editCard = transientDraftCard?.root
-            ?: (editingState as? InlineEditState.Existing)?.commentId?.let { cardViews[it]?.root }
+        val target = transientDraftCard?.root
+            ?: when (val active = editingState) {
+                is InlineEditState.EditComment -> threadViews[active.threadId]?.root
+                is InlineEditState.Reply -> threadViews[active.threadId]?.root
+                else -> null
+            }
             ?: return
         SwingUtilities.invokeLater {
-            findFirstTextArea(editCard)?.requestFocusInWindow()
+            findFirstTextArea(target)?.requestFocusInWindow()
         }
     }
 
@@ -597,34 +636,61 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         component.components.forEach { child ->
             when (child) {
                 is JTextArea -> return child
-                is JComponent -> {
-                    val found = findFirstTextArea(child)
-                    if (found != null) return found
-                }
+                is JComponent -> findFirstTextArea(child)?.let { return it }
             }
         }
         return null
     }
 
-    private fun saveNewDraft(editState: InlineEditState.New): Boolean {
+    private fun beginReply(threadId: String) {
+        val current = editingState
+        if (current is InlineEditState.Reply && current.threadId == threadId) {
+            focusActiveEditor()
+            return
+        }
+        finishActiveEditBefore {
+            editingState = InlineEditState.Reply(threadId, "")
+            renderCards()
+            threadViews[threadId]?.root?.let { cardsContainer.scrollRectToVisible(it.bounds) }
+            focusActiveEditor()
+        }
+    }
+
+    private fun saveNewThread(editState: InlineEditState.NewThread): Boolean {
         val text = editState.text.trim()
         if (text.isBlank()) return false
-
-        val created = CommentService.getInstance(project).add(
+        val created = CommentService.getInstance(project).addThread(
             file = editState.draft.file,
             startLine = editState.draft.startLine,
             endLine = editState.draft.endLine,
             codeSnippet = editState.draft.codeSnippet,
-            comment = text
+            comment = text,
+            reviewTargetRef = editState.draft.reviewTargetRef,
+            diffBaseCommit = editState.draft.diffBaseCommit,
+            diffHeadCommit = editState.draft.diffHeadCommit,
+            diffOldPath = editState.draft.diffOldPath,
+            diffNewPath = editState.draft.diffNewPath
         )
         editingState = null
-        CommentSelectionService.getInstance(project).select(created.id)
+        val root = rootComment(created) ?: return true
+        CommentSelectionService.getInstance(project).select(root.id)
         refresh()
-        startFlash(created.id)
+        startFlash(root.id)
         return true
     }
 
-    private fun saveExistingEdit(editState: InlineEditState.Existing): Boolean {
+    private fun saveReply(editState: InlineEditState.Reply): Boolean {
+        val text = editState.text.trim()
+        if (text.isBlank()) return false
+        val reply = CommentService.getInstance(project).addReply(editState.threadId, text) ?: return false
+        editingState = null
+        CommentSelectionService.getInstance(project).select(reply.id)
+        refresh()
+        startFlash(reply.id)
+        return true
+    }
+
+    private fun saveExistingEdit(editState: InlineEditState.EditComment): Boolean {
         val text = editState.text.trim()
         if (text.isBlank()) return false
         if (text == editState.originalText) {
@@ -632,7 +698,6 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             renderCards()
             return true
         }
-
         CommentService.getInstance(project).update(editState.commentId, text)
         editingState = null
         CommentSelectionService.getInstance(project).select(editState.commentId)
@@ -646,19 +711,16 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun finishActiveEditBefore(nextAction: () -> Unit) {
-        val active = editingState
-        if (active == null) {
+        val active = editingState ?: run {
             nextAction()
             return
         }
-
         if (!hasUnsavedChanges(active)) {
             editingState = null
             renderCards()
             nextAction()
             return
         }
-
         val result = Messages.showDialog(
             project,
             "You have an unsaved comment edit. What do you want to do?",
@@ -670,8 +732,9 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         when (result) {
             0 -> {
                 val saved = when (active) {
-                    is InlineEditState.New -> saveNewDraft(active)
-                    is InlineEditState.Existing -> saveExistingEdit(active)
+                    is InlineEditState.NewThread -> saveNewThread(active)
+                    is InlineEditState.Reply -> saveReply(active)
+                    is InlineEditState.EditComment -> saveExistingEdit(active)
                 }
                 if (saved) nextAction()
             }
@@ -685,17 +748,18 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun hasUnsavedChanges(active: InlineEditState): Boolean =
         when (active) {
-            is InlineEditState.New -> active.text.trim().isNotEmpty()
-            is InlineEditState.Existing -> active.text != active.originalText
+            is InlineEditState.NewThread -> active.text.trim().isNotEmpty()
+            is InlineEditState.Reply -> active.text.trim().isNotEmpty()
+            is InlineEditState.EditComment -> active.text != active.originalText
         }
 
     private fun navigateToDraft(draft: CommentDraft) {
+        if (MrReviewService.getInstance(project).navigateToDraft(draft)) return
         val target = ProjectFiles.find(project, draft.file) ?: run {
             CommentNotifications.warn(project, "Comment Target Missing", "Cannot find `${draft.file}` in the current project.")
             return
         }
-        val lineIndex = resolveLineIndex(target, draft.startLine)
-        if (lineIndex == null) {
+        val lineIndex = resolveLineIndex(target, draft.startLine) ?: run {
             CommentNotifications.warn(project, "Comment Target Outdated", "`${draft.file}` no longer has line ${draft.startLine}.")
             return
         }
@@ -703,21 +767,20 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun navigateTo(comment: ReviewComment, requestFocusComment: Boolean) {
+        if (!comment.outdated && MrReviewService.getInstance(project).navigateToComment(comment)) {
+            if (requestFocusComment) selectComment(comment.id)
+            return
+        }
         val target = ProjectFiles.find(project, comment.file) ?: run {
             CommentNotifications.warn(project, "Comment Target Missing", "Cannot find `${comment.file}` in the current project.")
             return
         }
-
-        val lineIndex = resolveLineIndex(target, comment.startLine)
-        if (lineIndex == null) {
+        val lineIndex = resolveLineIndex(target, comment.startLine) ?: run {
             CommentNotifications.warn(project, "Comment Target Outdated", "`${comment.file}` no longer has line ${comment.startLine}.")
             return
         }
-
         OpenFileDescriptor(project, target, lineIndex, 0).navigate(true)
-        if (requestFocusComment) {
-            selectComment(comment.id)
-        }
+        if (requestFocusComment) selectComment(comment.id)
     }
 
     private fun resolveLineIndex(target: VirtualFile, oneBasedLine: Int): Int? {
@@ -725,6 +788,22 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (document.lineCount <= 0) return 0
         val requested = oneBasedLine - 1
         return if (requested in 0 until document.lineCount) requested else null
+    }
+
+    private fun toggleResolved(thread: ReviewThread) {
+        val next = if (thread.status == "resolved") "open" else "resolved"
+        CommentService.getInstance(project).updateThreadStatus(thread.id, next)
+        refresh()
+    }
+
+    private fun deleteThread(thread: ReviewThread) {
+        if (Messages.YES != Messages.showYesNoDialog(project, "Delete this thread?", "Confirm", null)) return
+        CommentService.getInstance(project).deleteThread(thread.id)
+        val selected = CommentSelectionService.getInstance(project).currentSelection()
+        if (selected != null && thread.comments.any { it.id == selected }) {
+            CommentSelectionService.getInstance(project).select(null)
+        }
+        refresh()
     }
 
     private fun deleteComment(comment: ReviewComment) {
@@ -738,107 +817,21 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (CommentSelectionService.getInstance(project).currentSelection() == comment.id) {
             CommentSelectionService.getInstance(project).select(null)
         }
-        if (editingState is InlineEditState.Existing && (editingState as InlineEditState.Existing).commentId == comment.id) {
-            editingState = null
-        }
         refresh()
     }
 
-    private fun fileNameOf(path: String): String = path.substringAfterLast('/')
+    private fun rootComment(thread: ReviewThread): ReviewComment? =
+        thread.comments.firstOrNull()
 
-    private fun buildLocationLabel(path: String, lines: String): String {
-        val parent = path.substringBeforeLast('/', "")
-        return if (parent.isBlank()) "Lines $lines" else "${shortenParentPath(parent)} • Lines $lines"
-    }
+    private fun canDeleteThread(thread: ReviewThread): Boolean =
+        rootComment(thread)?.let(::canModify) == true
 
-    private fun shortenParentPath(path: String, maxLength: Int = 52): String {
-        if (path.length <= maxLength) return path
-        val keepStart = (maxLength * 0.55).toInt().coerceAtLeast(10)
-        val keepEnd = (maxLength - keepStart - 1).coerceAtLeast(8)
-        return "${path.take(keepStart)}…${path.takeLast(keepEnd)}"
-    }
-
-    private fun buildAuthorAndTime(comment: ReviewComment): String {
-        val author = comment.remoteAuthorName?.takeIf { it.isNotBlank() }
-        val updated = "Updated ${formatTimestamp(comment.updatedAt)}"
-        return if (author == null) updated else "$author • $updated"
-    }
-
-    private fun buildInfoRow(comment: ReviewComment): JComponent {
-        val metaLabel = JBLabel(buildAuthorAndTime(comment)).apply {
-            foreground = UIUtil.getContextHelpForeground()
-            font = uiFont(10f)
-            alignmentX = Component.LEFT_ALIGNMENT
+    private fun canModify(comment: ReviewComment): Boolean {
+        comment.createdByUsername?.takeIf { it.isNotBlank() }?.let {
+            // Username-based matching can be added later once the local git identity exposes it.
         }
-        val row = JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(8))).apply {
-            isOpaque = false
-            alignmentX = Component.LEFT_ALIGNMENT
-            statusBadge(comment)?.let { add(it) }
-            findingBadge(comment)?.let { add(it) }
-            add(metaLabel)
-        }
-        return row
-    }
-
-    private fun buildMetaOnlyRow(text: String): JComponent =
-        JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(8))).apply {
-            isOpaque = false
-            alignmentX = Component.LEFT_ALIGNMENT
-            add(JBLabel(text).apply {
-                foreground = UIUtil.getContextHelpForeground()
-                font = uiFont(10f)
-                alignmentX = Component.LEFT_ALIGNMENT
-            })
-        }
-
-    private fun findingBadge(comment: ReviewComment): JComponent? {
-        val label = comment.findingId?.takeIf { it.isNotBlank() } ?: return null
-        val tone = Color(0x6B8AD1)
-        val foreground = mix(UIUtil.getLabelForeground(), tone, 0.48f)
-        val background = mix(UIUtil.getPanelBackground(), tone, 0.08f)
-        return JBLabel(label).apply {
-            font = uiFont(10f)
-            this.foreground = foreground
-            isOpaque = true
-            this.background = background
-            border = BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(mix(background, tone, 0.22f), 1),
-                JBUI.Borders.empty(1, 6)
-            )
-            toolTipText = "Source finding $label"
-        }
-    }
-
-    private fun statusBadge(comment: ReviewComment): JComponent? {
-        val label = when (comment.syncStatus) {
-            "local_only" -> "Local"
-            "modified" -> "Modified"
-            "delete_pending" -> "Delete pending"
-            "synced" -> "Synced"
-            else -> comment.syncStatus.takeIf { it.isNotBlank() }?.replace('_', ' ')
-        } ?: return null
-
-        val accent = EditorColorsManager.getInstance().globalScheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR)
-            ?: UIUtil.getFocusedFillColor()
-        val tone = when (comment.syncStatus) {
-            "delete_pending" -> Color(0xD06565)
-            "modified" -> Color(0xC9913A)
-            "synced" -> Color(0x5E9E78)
-            else -> mix(accent, Color(0x7F8FA6), 0.55f)
-        }
-        val foreground = mix(UIUtil.getLabelForeground(), tone, 0.42f)
-        val background = mix(UIUtil.getPanelBackground(), tone, 0.08f)
-
-        return JBLabel(label).apply {
-            font = uiFont(10f)
-            this.foreground = foreground
-            isOpaque = true
-            this.background = background
-            border = BorderFactory.createCompoundBorder(
-                BorderFactory.createLineBorder(mix(background, tone, 0.22f), 1),
-                JBUI.Borders.empty(1, 6)
-            )
-        }
+        val author = comment.createdByName?.takeIf { it.isNotBlank() } ?: return comment.remoteCommentId == null
+        return GitUserProvider.matchesCurrentUser(project, author)
     }
 
     private fun startFlash(commentId: String) {
@@ -866,28 +859,33 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun refreshCardStyles() {
         val selectedId = CommentSelectionService.getInstance(project).currentSelection()
-        cardViews.forEach { (id, cardView) ->
-            applyCardStyle(cardView, isSelected = id == selectedId)
+        threadViews.forEach { (threadId, view) ->
+            val thread = threads.firstOrNull { it.id == threadId }
+            val isSelected = thread?.comments?.any { it.id == selectedId } == true
+            val isFlashing = flashOn && thread?.comments?.any { it.id == flashingCommentId } == true
+            applyCardStyle(view, isSelected, isFlashing)
         }
-        transientDraftCard?.let { applyCardStyle(it, isSelected = editingState is InlineEditState.New) }
+        transientDraftCard?.let { applyCardStyle(it, editingState is InlineEditState.NewThread, false) }
     }
 
-    private fun canModify(comment: ReviewComment): Boolean {
-        val remoteAuthor = comment.remoteAuthorName?.takeIf { it.isNotBlank() }
-        if (remoteAuthor != null) {
-            return GitUserProvider.matchesCurrentUser(project, remoteAuthor)
-        }
-
-        val createdBy = comment.createdByName?.takeIf { it.isNotBlank() }
-        if (createdBy != null) {
-            return GitUserProvider.matchesCurrentUser(project, createdBy)
-        }
-
-        // Backward compatibility for older local comments created before ownership metadata existed.
-        return comment.remoteProvider == null && comment.remoteDiscussionId == null && comment.remoteNoteId == null
+    private fun buildCommentMeta(comment: ReviewComment): String {
+        val author = comment.createdByName?.takeIf { it.isNotBlank() } ?: "Unknown"
+        return "$author • ${formatTimestamp(comment.updatedAt)}"
     }
 
-    private fun lineRange(comment: ReviewComment): String = lineRange(comment.startLine, comment.endLine)
+    private fun fileNameOf(path: String): String = path.substringAfterLast('/')
+
+    private fun buildLocationLabel(path: String, lines: String): String {
+        val parent = path.substringBeforeLast('/', "")
+        return if (parent.isBlank()) "Lines $lines" else "${shortenParentPath(parent)} • Lines $lines"
+    }
+
+    private fun shortenParentPath(path: String, maxLength: Int = 52): String {
+        if (path.length <= maxLength) return path
+        val keepStart = (maxLength * 0.55).toInt().coerceAtLeast(10)
+        val keepEnd = (maxLength - keepStart - 1).coerceAtLeast(8)
+        return "${path.take(keepStart)}…${path.takeLast(keepEnd)}"
+    }
 
     private fun lineRange(startLine: Int, endLine: Int): String =
         if (startLine == endLine) "$startLine" else "$startLine-$endLine"
@@ -905,15 +903,40 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         return if (bold) font.deriveFont(Font.BOLD) else font
     }
 
-    private fun cardActionLink(text: String, action: () -> Unit): ActionLink =
-        ActionLink(text) { action() }.apply {
-            font = uiFont(10f)
-        }
-
     private fun bodyFont(): Font {
         val editorFont = EditorColorsManager.getInstance().globalScheme.getFont(EditorFontType.PLAIN)
         val reducedSize = (editorFont.size2D - 1f).coerceAtLeast(11f)
         return editorFont.deriveFont(reducedSize)
+    }
+
+    private fun cardAction(text: String, action: () -> Unit): ActionLink =
+        ActionLink(text) { action() }.apply { font = uiFont(10f) }
+
+    private fun commentAction(text: String, action: () -> Unit): ActionLink =
+        ActionLink(text) { action() }.apply { font = uiFont(10f) }
+
+    private fun installClickTarget(component: Component, listener: MouseAdapter) {
+        installClickTarget(component, listener, skipOwnedSubtrees = false)
+    }
+
+    private fun installClickTarget(component: Component, listener: MouseAdapter, skipOwnedSubtrees: Boolean) {
+        if (component is JButton || component is ActionLink || component is JTextArea) {
+            return
+        }
+        if (skipOwnedSubtrees && component is JComponent && component.getClientProperty(CLICK_OWNED_CLIENT_PROPERTY) == true) {
+            return
+        }
+        component.addMouseListener(listener)
+        if (component is JComponent) {
+            component.cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+            component.components.forEach { child ->
+                installClickTarget(child, listener, skipOwnedSubtrees)
+            }
+        }
+    }
+
+    private fun markClickOwned(component: JComponent) {
+        component.putClientProperty(CLICK_OWNED_CLIENT_PROPERTY, true)
     }
 
     private fun mix(base: Color, accent: Color, weight: Float): Color {
@@ -933,27 +956,28 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     companion object {
         const val TOOL_WINDOW_ID = "Code Review"
+        private const val CLICK_OWNED_CLIENT_PROPERTY = "code.review.click.owned"
         private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
     }
 
     private sealed interface InlineEditState {
         var text: String
 
-        data class New(val draft: CommentDraft, override var text: String) : InlineEditState
+        data class NewThread(val draft: CommentDraft, override var text: String) : InlineEditState
 
-        data class Existing(
+        data class Reply(val threadId: String, override var text: String) : InlineEditState
+
+        data class EditComment(
+            val threadId: String,
             val commentId: String,
             val originalText: String,
             override var text: String
         ) : InlineEditState
     }
 
-    private data class CommentCardView(
+    private data class ThreadCardView(
         val root: JComponent,
         val stripe: JComponent,
-        val hoverActionContent: JComponent?,
-        val showActionsOnHover: Boolean,
-        val commentId: String? = null,
-        var hovered: Boolean = false
+        val threadId: String
     )
 }
