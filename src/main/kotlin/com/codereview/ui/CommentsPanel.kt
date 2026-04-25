@@ -774,6 +774,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
             statusBadge(comment)?.let { add(it) }
+            findingBadge(comment)?.let { add(it) }
             add(metaLabel)
         }
         return row
@@ -789,6 +790,24 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
                 alignmentX = Component.LEFT_ALIGNMENT
             })
         }
+
+    private fun findingBadge(comment: ReviewComment): JComponent? {
+        val label = comment.findingId?.takeIf { it.isNotBlank() } ?: return null
+        val tone = Color(0x6B8AD1)
+        val foreground = mix(UIUtil.getLabelForeground(), tone, 0.48f)
+        val background = mix(UIUtil.getPanelBackground(), tone, 0.08f)
+        return JBLabel(label).apply {
+            font = uiFont(10f)
+            this.foreground = foreground
+            isOpaque = true
+            this.background = background
+            border = BorderFactory.createCompoundBorder(
+                BorderFactory.createLineBorder(mix(background, tone, 0.22f), 1),
+                JBUI.Borders.empty(1, 6)
+            )
+            toolTipText = "Source finding $label"
+        }
+    }
 
     private fun statusBadge(comment: ReviewComment): JComponent? {
         val label = when (comment.syncStatus) {

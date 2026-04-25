@@ -19,10 +19,12 @@ data class ReviewComment(
     var remoteNoteId: String? = null,
     var remoteAuthorName: String? = null,
     var remoteUrl: String? = null,
-    var lastSyncedAt: String? = null
+    var lastSyncedAt: String? = null,
+    var findingId: String? = null
 )
 
 data class CommentFile(
     var branch: String,
-    var comments: MutableList<ReviewComment> = mutableListOf()
+    var comments: MutableList<ReviewComment> = mutableListOf(),
+    var reviewDoc: String? = null
 )
