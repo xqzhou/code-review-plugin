@@ -1,0 +1,45 @@
+<idea-plugin>
+    <id>com.codereview.comments</id>
+    <name>Code Review Comments</name>
+    <vendor email="xiaoqiang.chou@gmail.com">codereview</vendor>
+
+    <description><![CDATA[
+        Local code review comments for GoLand.
+        <ul>
+            <li>Add comments on selected lines or code blocks</li>
+            <li>Comments stored locally as JSON, scoped per git branch</li>
+            <li>Gutter icons + tool window for navigation</li>
+            <li>Designed to be picked up by an external skill and pushed to a Merge Request</li>
+        </ul>
+    ]]></description>
+
+    <depends>com.intellij.modules.platform</depends>
+    <depends>Git4Idea</depends>
+
+    <extensions defaultExtensionNs="com.intellij">
+        <projectService serviceImplementation="com.codereview.service.CommentService"/>
+        <projectService serviceImplementation="com.codereview.service.CommentSelectionService"/>
+        <projectService serviceImplementation="com.codereview.ui.CommentToolWindowService"/>
+        <projectService serviceImplementation="com.codereview.editor.CommentEditorDecorations"/>
+
+        <toolWindow id="Code Review"
+                    anchor="right"
+                    icon="/icons/comment.svg"
+                    factoryClass="com.codereview.ui.CommentsToolWindowFactory"/>
+
+        <postStartupActivity implementation="com.codereview.startup.CommentProjectActivity"/>
+
+        <notificationGroup id="CodeReview.Notifications"
+                           displayType="BALLOON"/>
+    </extensions>
+
+    <actions>
+        <action id="CodeReview.AddComment"
+                class="com.codereview.actions.AddCommentAction"
+                text="Add Code Review Comment"
+                description="Add a code review comment on the selected lines">
+            <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+            <keyboard-shortcut keymap="$default" first-keystroke="shift meta M"/>
+        </action>
+    </actions>
+</idea-plugin>
