@@ -40,6 +40,8 @@
                 text="Add Code Review Comment"
                 description="Add a code review comment on the selected lines">
             <add-to-group group-id="EditorPopupMenu" anchor="first"/>
+            <add-to-group group-id="Diff.EditorPopupMenu" anchor="first"/>
+            <add-to-group group-id="Diff.ViewerPopupMenu" anchor="first"/>
             <keyboard-shortcut keymap="$default" first-keystroke="shift meta M"/>
         </action>
     </actions>

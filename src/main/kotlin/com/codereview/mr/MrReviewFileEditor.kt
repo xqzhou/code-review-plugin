@@ -15,6 +15,7 @@ import com.intellij.codeInsight.navigation.actions.TypeDeclarationProvider
 import com.intellij.diff.DiffManager
 import com.intellij.diff.DiffRequestPanel
 import com.intellij.diff.tools.util.DiffDataKeys
+import com.intellij.diff.tools.util.PrevNextDifferenceIterable
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.Side
 import com.intellij.ide.DataManager
@@ -23,6 +24,7 @@ import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.actionSystem.CustomShortcutSet
 import com.intellij.openapi.actionSystem.IdeActions
+import com.intellij.openapi.actionSystem.KeyboardShortcut
 import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
@@ -67,6 +69,9 @@ import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Component
 import java.awt.FlowLayout
+import java.awt.KeyboardFocusManager
+import java.awt.KeyEventDispatcher
+import java.awt.event.KeyEvent
 import java.beans.PropertyChangeListener
 import java.beans.PropertyChangeSupport
 import javax.swing.BorderFactory
@@ -74,6 +79,7 @@ import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.SwingConstants
 import javax.swing.SwingUtilities
+import javax.swing.KeyStroke
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 import javax.swing.tree.DefaultMutableTreeNode
@@ -154,18 +160,35 @@ class MrReviewFileEditor(
     private var fileListVisible = uiState.fileListVisible()
     private var expandedListProportion = uiState.fileListProportion().coerceIn(0.05f, 0.95f)
 
-    private val gotoDeclarationShortcut = CustomShortcutSet(
-        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_DECLARATION).shortcuts
-    )
-    private val gotoImplementationShortcut = CustomShortcutSet(
-        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_IMPLEMENTATION).shortcuts
-    )
-    private val gotoTypeDeclarationShortcut = CustomShortcutSet(
-        *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_TYPE_DECLARATION).shortcuts
-    )
+    private val gotoDeclarationShortcut = diffSafeShortcutSet(IdeActions.ACTION_GOTO_DECLARATION)
+    private val gotoImplementationShortcut = diffSafeShortcutSet(IdeActions.ACTION_GOTO_IMPLEMENTATION)
+    private val gotoTypeDeclarationShortcut = diffSafeShortcutSet(IdeActions.ACTION_GOTO_TYPE_DECLARATION)
     private val gotoBackShortcut = CustomShortcutSet(
         *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_BACK).shortcuts
     )
+    private val nextDifferenceShortcut = CustomShortcutSet(
+        *KeymapUtil.getActiveKeymapShortcuts("NextDiff").shortcuts
+    )
+    private val previousDifferenceShortcut = CustomShortcutSet(
+        *KeymapUtil.getActiveKeymapShortcuts("PreviousDiff").shortcuts
+    )
+    private val nextDifferenceKeyStrokes = keyStrokesForAction("NextDiff")
+    private val previousDifferenceKeyStrokes = keyStrokesForAction("PreviousDiff")
+    private var diffNavigationDispatcherInstalled = false
+
+    private val diffNavigationKeyDispatcher = KeyEventDispatcher { event ->
+        if (event.id != KeyEvent.KEY_PRESSED) return@KeyEventDispatcher false
+        if (!isFocusInsideDiffEditor()) return@KeyEventDispatcher false
+        val handled = when (diffNavigationDirection(event)) {
+            true -> navigateDifferenceOrFile(next = true)
+            false -> navigateDifferenceOrFile(next = false)
+            else -> false
+        }
+        if (handled) {
+            event.consume()
+        }
+        handled
+    }
 
     private val navigateFromDiffAction = object : DumbAwareAction() {
         override fun actionPerformed(e: AnActionEvent) {
@@ -193,6 +216,22 @@ class MrReviewFileEditor(
                     AnActionEvent.createFromAnAction(action, e.inputEvent, e.place, e.dataContext)
                 )
             }
+        }
+    }
+
+    private val nextDifferenceFromDiffAction = object : DumbAwareAction() {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun actionPerformed(e: AnActionEvent) {
+            navigateDifferenceOrFile(next = true, e)
+        }
+    }
+
+    private val previousDifferenceFromDiffAction = object : DumbAwareAction() {
+        override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.EDT
+
+        override fun actionPerformed(e: AnActionEvent) {
+            navigateDifferenceOrFile(next = false, e)
         }
     }
 
@@ -634,11 +673,14 @@ class MrReviewFileEditor(
         if (navigationEditors == editors) return
         uninstallNavigationSupport()
         navigationEditors = editors
+        installDiffNavigationKeyDispatcher()
         editors.forEach { editor ->
             navigateFromDiffAction.registerCustomShortcutSet(gotoDeclarationShortcut, editor.contentComponent, this)
             navigateToImplementationAction.registerCustomShortcutSet(gotoImplementationShortcut, editor.contentComponent, this)
             navigateToTypeDeclarationAction.registerCustomShortcutSet(gotoTypeDeclarationShortcut, editor.contentComponent, this)
             navigateBackFromDiffAction.registerCustomShortcutSet(gotoBackShortcut, editor.contentComponent, this)
+            nextDifferenceFromDiffAction.registerCustomShortcutSet(nextDifferenceShortcut, editor.contentComponent, this)
+            previousDifferenceFromDiffAction.registerCustomShortcutSet(previousDifferenceShortcut, editor.contentComponent, this)
             editor.addEditorMouseListener(navigateMouseListener, this)
         }
     }
@@ -649,8 +691,92 @@ class MrReviewFileEditor(
             navigateToImplementationAction.unregisterCustomShortcutSet(editor.contentComponent)
             navigateToTypeDeclarationAction.unregisterCustomShortcutSet(editor.contentComponent)
             navigateBackFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
+            nextDifferenceFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
+            previousDifferenceFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
         }
+        uninstallDiffNavigationKeyDispatcher()
         navigationEditors = emptyList()
+    }
+
+    private fun diffSafeShortcutSet(actionId: String): CustomShortcutSet {
+        val diffNavigationShortcuts = DIFF_NAVIGATION_ACTION_IDS
+            .flatMap { KeymapUtil.getActiveKeymapShortcuts(it).shortcuts.asIterable() }
+            .toSet()
+        val shortcuts = KeymapUtil.getActiveKeymapShortcuts(actionId).shortcuts
+            .filterNot { it in diffNavigationShortcuts }
+            .toTypedArray()
+        return CustomShortcutSet(*shortcuts)
+    }
+
+    private fun keyStrokesForAction(actionId: String): Set<KeyStroke> =
+        KeymapUtil.getActiveKeymapShortcuts(actionId).shortcuts
+            .mapNotNull { (it as? KeyboardShortcut)?.firstKeyStroke }
+            .toSet()
+
+    private fun installDiffNavigationKeyDispatcher() {
+        if (diffNavigationDispatcherInstalled) return
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(diffNavigationKeyDispatcher)
+        diffNavigationDispatcherInstalled = true
+    }
+
+    private fun uninstallDiffNavigationKeyDispatcher() {
+        if (!diffNavigationDispatcherInstalled) return
+        KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(diffNavigationKeyDispatcher)
+        diffNavigationDispatcherInstalled = false
+    }
+
+    private fun isFocusInsideDiffEditor(): Boolean {
+        val focusOwner = KeyboardFocusManager.getCurrentKeyboardFocusManager().focusOwner ?: return false
+        return navigationEditors.any { editor ->
+            focusOwner == editor.contentComponent || SwingUtilities.isDescendingFrom(focusOwner, editor.contentComponent)
+        }
+    }
+
+    private fun diffNavigationDirection(event: KeyEvent): Boolean? {
+        val keyStroke = KeyStroke.getKeyStrokeForEvent(event)
+        return when {
+            keyStroke in nextDifferenceKeyStrokes -> true
+            keyStroke in previousDifferenceKeyStrokes -> false
+            event.keyCode == KeyEvent.VK_F7 && event.isShiftDown -> false
+            event.keyCode == KeyEvent.VK_F7 -> true
+            else -> null
+        }
+    }
+
+    private fun navigateDifferenceOrFile(next: Boolean, e: AnActionEvent): Boolean {
+        val iterable = e.getData(DiffDataKeys.PREV_NEXT_DIFFERENCE_ITERABLE) ?: currentDifferenceIterable()
+        return navigateDifferenceOrFile(next, iterable)
+    }
+
+    private fun navigateDifferenceOrFile(next: Boolean): Boolean =
+        navigateDifferenceOrFile(next, currentDifferenceIterable())
+
+    private fun navigateDifferenceOrFile(next: Boolean, iterable: PrevNextDifferenceIterable?): Boolean {
+        if (iterable != null) {
+            if (next && iterable.canGoNext()) {
+                iterable.goNext()
+                return true
+            }
+            if (!next && iterable.canGoPrev()) {
+                iterable.goPrev()
+                return true
+            }
+        }
+        return navigateAdjacentChange(next)
+    }
+
+    private fun currentDifferenceIterable(): PrevNextDifferenceIterable? =
+        currentViewer()?.let { viewer ->
+            viewer.javaClass.methods
+                .firstOrNull { it.name == "getDifferenceIterable" && it.parameterTypes.isEmpty() }
+                ?.invoke(viewer) as? PrevNextDifferenceIterable
+        }
+
+    private fun navigateAdjacentChange(next: Boolean): Boolean {
+        val activeSession = session ?: return false
+        val targetIndex = if (next) selectedChangeIndex + 1 else selectedChangeIndex - 1
+        if (targetIndex !in activeSession.changes.indices) return false
+        return service.navigateToChange(targetIndex)
     }
 
     private fun navigateFromDiffCaret(editor: EditorEx?): Boolean {
@@ -980,4 +1106,13 @@ class MrReviewFileEditor(
             status.startsWith("C") -> "C"
             else -> "M"
         }
+
+    companion object {
+        private val DIFF_NAVIGATION_ACTION_IDS = setOf(
+            "PreviousDiff",
+            "NextDiff",
+            "Diff.PrevChange",
+            "Diff.NextChange"
+        )
+    }
 }

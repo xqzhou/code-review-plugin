@@ -86,6 +86,13 @@ class MrReviewService(private val project: Project) {
         return buildRequest(session, change, line, side)
     }
 
+    fun navigateToChange(changeIndex: Int): Boolean {
+        val session = currentSession ?: return false
+        val change = session.changes.getOrNull(changeIndex) ?: return false
+        showSession(session, ReviewNavigation(changeIndex, side = preferredSide(change)))
+        return true
+    }
+
     fun navigateToFileDiff(targetFile: VirtualFile, line: Int, from: ReviewNavigation? = null): Boolean {
         val session = currentSession ?: return false
         val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return false
