@@ -121,16 +121,23 @@ class MrReviewService(private val project: Project) {
 
     fun navigateToComment(comment: ReviewComment): Boolean {
         currentSession?.let { active ->
-            val activeIndex = findChangeIndex(active, comment.diffOldPath, comment.diffNewPath, comment.file)
-            if (activeIndex >= 0) {
-                showSession(active, ReviewNavigation(activeIndex, comment.startLine))
-                return true
+            val canUseActiveSession = if (comment.reviewTargetRef != null && comment.diffHeadCommit != null) {
+                matchesSession(active, comment.reviewTargetRef, comment.diffBaseCommit, comment.diffHeadCommit)
+            } else {
+                true
+            }
+            if (canUseActiveSession) {
+                val activeIndex = findChangeIndex(active, comment.diffOldPath, comment.diffNewPath, comment.file)
+                if (activeIndex >= 0) {
+                    showSession(active, ReviewNavigation(activeIndex, comment.startLine))
+                    return true
+                }
             }
         }
 
         val targetRef = comment.reviewTargetRef ?: return false
         val headCommit = comment.diffHeadCommit ?: return false
-        val session = ensureSession(targetRef, headCommit, warnOnFailure = false) ?: return false
+        val session = ensureSession(targetRef, comment.diffBaseCommit, headCommit, warnOnFailure = false) ?: return false
         val index = findChangeIndex(session, comment.diffOldPath, comment.diffNewPath, comment.file)
         if (index < 0) return false
         showSession(session, ReviewNavigation(index, comment.startLine))
@@ -140,23 +147,34 @@ class MrReviewService(private val project: Project) {
     fun navigateToDraft(draft: CommentDraft): Boolean {
         val targetRef = draft.reviewTargetRef ?: return false
         val headCommit = draft.diffHeadCommit ?: return false
-        val session = ensureSession(targetRef, headCommit, warnOnFailure = false) ?: return false
+        val session = ensureSession(targetRef, draft.diffBaseCommit, headCommit, warnOnFailure = false) ?: return false
         val index = findChangeIndex(session, draft.diffOldPath, draft.diffNewPath, draft.file)
         if (index < 0) return false
         showSession(session, ReviewNavigation(index, draft.startLine))
         return true
     }
 
-    private fun ensureSession(targetRef: String, headCommit: String, warnOnFailure: Boolean = true): MrReviewSession? {
+    private fun ensureSession(
+        targetRef: String,
+        baseCommit: String?,
+        headCommit: String,
+        warnOnFailure: Boolean = true
+    ): MrReviewSession? {
         val active = currentSession
-        if (active != null && matchesSession(active, targetRef, headCommit)) {
+        if (active != null && matchesSession(active, targetRef, baseCommit, headCommit)) {
             return active
         }
-        return prepareSession(expectedTargetRef = targetRef, expectedHeadCommit = headCommit, warnOnFailure = warnOnFailure)
+        return prepareSession(
+            expectedTargetRef = targetRef,
+            expectedBaseCommit = baseCommit,
+            expectedHeadCommit = headCommit,
+            warnOnFailure = warnOnFailure
+        )
     }
 
     private fun prepareSession(
         expectedTargetRef: String? = null,
+        expectedBaseCommit: String? = null,
         expectedHeadCommit: String? = null,
         warnOnFailure: Boolean = true
     ): MrReviewSession? {
@@ -184,7 +202,12 @@ class MrReviewService(private val project: Project) {
         val completed = ProgressManager.getInstance().runProcessWithProgressSynchronously(
             {
                 try {
-                    session = buildSession(repository, reviewContext)
+                    session = buildSession(
+                        repository,
+                        reviewContext,
+                        baseCommitOverride = expectedBaseCommit,
+                        headCommitOverride = expectedHeadCommit
+                    )
                 } catch (t: Throwable) {
                     failure = t.message ?: "Failed to prepare MR diff review."
                 }
@@ -283,55 +306,38 @@ class MrReviewService(private val project: Project) {
             mrId = data.mrId,
             title = data.title,
             sourceBranch = sourceBranch,
-            targetRef = targetRef,
-            baseCommit = data.baseCommit?.takeIf { it.isNotBlank() },
-            headCommit = data.headCommit?.takeIf { it.isNotBlank() }
+            targetRef = targetRef
         )
     }
 
-    private fun buildSession(repository: GitRepository, context: ReviewContext): MrReviewSession {
-        val headCommit = context.headCommit?.takeIf { canResolve(repository, it) }
+    private fun buildSession(
+        repository: GitRepository,
+        context: ReviewContext,
+        baseCommitOverride: String? = null,
+        headCommitOverride: String? = null
+    ): MrReviewSession {
+        if (!canResolve(repository, context.targetRef)) {
+            error("Current branch review context points to `${context.targetRef}`, but that ref is not available locally.")
+        }
+
+        val headCommit = headCommitOverride?.takeIf { canResolve(repository, it) }
             ?: git(repository, GitCommand.REV_PARSE, "HEAD").singleLine("Could not resolve `HEAD`.")
-        val baseCommit = context.baseCommit?.takeIf { canResolve(repository, it) }
+        val baseCommit = baseCommitOverride?.takeIf { canResolve(repository, it) }
+            ?: git(repository, GitCommand.MERGE_BASE, context.targetRef, headCommit)
+                .singleLine("Could not resolve merge-base for `${context.targetRef}`.")
 
-        val diffAnchor = if (baseCommit != null) {
-            DiffAnchor.Revisions(baseCommit = baseCommit, headCommit = headCommit)
-        } else {
-            if (!canResolve(repository, context.targetRef)) {
-                error("Current branch review context points to `${context.targetRef}`, but that ref is not available locally.")
-            }
-            DiffAnchor.TargetRef(targetRef = context.targetRef, headCommit = headCommit)
-        }
-
-        val nameStatusLines = when (diffAnchor) {
-            is DiffAnchor.Revisions -> git(
-                repository,
-                GitCommand.DIFF,
-                "--name-status",
-                "--find-renames",
-                diffAnchor.baseCommit,
-                diffAnchor.headCommit
-            ).lines
-
-            is DiffAnchor.TargetRef -> git(
-                repository,
-                GitCommand.DIFF,
-                "--name-status",
-                "--find-renames",
-                diffAnchor.targetRef,
-                diffAnchor.headCommit
-            ).lines
-        }
+        val nameStatusLines = git(
+            repository,
+            GitCommand.DIFF,
+            "--name-status",
+            "--find-renames",
+            baseCommit,
+            headCommit
+        ).lines
 
         var skippedBinaryFiles = 0
         val changes = parseNameStatus(nameStatusLines).mapNotNull { entry ->
-            val change = when (diffAnchor) {
-                is DiffAnchor.Revisions ->
-                    buildChange(repository, diffAnchor.baseCommit, diffAnchor.headCommit, entry)
-
-                is DiffAnchor.TargetRef ->
-                    buildChange(repository, diffAnchor.targetRef, diffAnchor.headCommit, entry)
-            }
+            val change = buildChange(repository, baseCommit, headCommit, entry)
             if (change == null) skippedBinaryFiles += 1
             change
         }
@@ -342,8 +348,7 @@ class MrReviewService(private val project: Project) {
             title = context.title,
             sourceBranch = context.sourceBranch,
             targetRef = context.targetRef,
-            mergeBaseCommit = baseCommit ?: git(repository, GitCommand.MERGE_BASE, context.targetRef, headCommit)
-                .singleLine("Could not resolve merge-base for `${context.targetRef}`."),
+            mergeBaseCommit = baseCommit,
             headCommit = headCommit,
             changes = changes,
             skippedBinaryFiles = skippedBinaryFiles
@@ -479,15 +484,15 @@ class MrReviewService(private val project: Project) {
     private fun buildRuntimeChange(session: MrReviewSession, targetFile: VirtualFile): MrReviewChange? {
         val repository = repository() ?: return null
         val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return null
-        val existsOnTarget = gitFileExists(repository, session.targetRef, relativePath)
+        val existsOnBase = gitFileExists(repository, session.mergeBaseCommit, relativePath)
         val existsOnHead = gitFileExists(repository, session.headCommit, relativePath)
-        if (!existsOnTarget && !existsOnHead) return null
+        if (!existsOnBase && !existsOnHead) return null
 
-        val oldPath = relativePath.takeIf { existsOnTarget }
+        val oldPath = relativePath.takeIf { existsOnBase }
         val newPath = relativePath.takeIf { existsOnHead }
-        val oldContent = oldPath?.let { gitShow(repository, session.targetRef, it) }.orEmpty()
+        val oldContent = oldPath?.let { gitShow(repository, session.mergeBaseCommit, it) }.orEmpty()
         val newContent = newPath?.let { gitShow(repository, session.headCommit, it) }.orEmpty()
-        val stats = diffStats(repository, session.targetRef, session.headCommit, oldPath, newPath)
+        val stats = diffStats(repository, session.mergeBaseCommit, session.headCommit, oldPath, newPath)
         val status = when {
             oldPath == null -> "A"
             newPath == null -> "D"
@@ -579,8 +584,15 @@ class MrReviewService(private val project: Project) {
     private fun preferredSide(change: MrReviewChange): Side =
         if (change.newPath != null) Side.RIGHT else Side.LEFT
 
-    private fun matchesSession(session: MrReviewSession, targetRef: String?, headCommit: String?): Boolean =
-        targetRef == session.targetRef && headCommit == session.headCommit
+    private fun matchesSession(
+        session: MrReviewSession,
+        targetRef: String?,
+        baseCommit: String?,
+        headCommit: String?
+    ): Boolean =
+        targetRef == session.targetRef &&
+            (baseCommit == null || baseCommit == session.mergeBaseCommit) &&
+            headCommit == session.headCommit
 
     private fun findChangeIndex(session: MrReviewSession, oldPath: String?, newPath: String?, file: String): Int =
         session.changes.indexOfFirst { change ->
@@ -615,15 +627,8 @@ class MrReviewService(private val project: Project) {
         val mrId: String?,
         val title: String?,
         val sourceBranch: String,
-        val targetRef: String,
-        val baseCommit: String?,
-        val headCommit: String?
+        val targetRef: String
     )
-
-    private sealed interface DiffAnchor {
-        data class Revisions(val baseCommit: String, val headCommit: String) : DiffAnchor
-        data class TargetRef(val targetRef: String, val headCommit: String) : DiffAnchor
-    }
 
     companion object {
         @JvmField

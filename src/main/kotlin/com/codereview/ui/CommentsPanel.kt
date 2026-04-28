@@ -71,11 +71,14 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     private val cardsContainer = JBPanel<JBPanel<*>>().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
         border = JBUI.Borders.empty(12)
+        isOpaque = true
+        background = panelSurface()
     }
     private val cardsScrollPane = JBScrollPane(cardsContainer).apply {
         border = BorderFactory.createEmptyBorder()
         horizontalScrollBarPolicy = JBScrollPane.HORIZONTAL_SCROLLBAR_NEVER
         verticalScrollBar.unitIncrement = JBUI.scale(16)
+        viewport.background = panelSurface()
     }
     private val emptyState = JBLabel("No comments on this branch yet.").apply {
         border = JBUI.Borders.empty(24, 0)
@@ -131,6 +134,8 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun buildCommentsArea(): JComponent =
         JBPanel<JBPanel<*>>(BorderLayout()).apply {
             border = JBUI.Borders.empty(0, 0, 0, 12)
+            isOpaque = true
+            background = panelSurface()
             add(JBLabel("Comments").apply {
                 border = JBUI.Borders.empty(12, 12, 0, 12)
             }, BorderLayout.NORTH)
@@ -208,6 +213,8 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         threadViews.clear()
         transientDraftCard = null
         cardsContainer.removeAll()
+        cardsContainer.background = panelSurface()
+        cardsScrollPane.viewport.background = panelSurface()
 
         val activeEdit = editingState
         if (activeEdit is InlineEditState.NewThread) {
@@ -400,7 +407,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             wrapStyleWord = true
             font = bodyFont()
             foreground = UIUtil.getLabelForeground()
-            background = UIUtil.getPanelBackground()
+            background = inputSurface()
             border = JBUI.Borders.empty(8)
             rows = 4
             alignmentX = Component.LEFT_ALIGNMENT
@@ -515,7 +522,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun infoBadge(text: String, tone: Color): JComponent {
         val foreground = mix(UIUtil.getLabelForeground(), tone, 0.42f)
-        val background = mix(UIUtil.getPanelBackground(), tone, 0.08f)
+        val background = mix(cardSurface(), tone, 0.08f)
         return JBLabel(text).apply {
             font = uiFont(10f)
             this.foreground = foreground
@@ -569,25 +576,25 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun applyCardStyle(view: ThreadCardView, isSelected: Boolean, isFlashing: Boolean) {
-        val base = UIUtil.getPanelBackground()
+        val base = cardSurface()
         val accent = EditorColorsManager.getInstance().globalScheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR)
             ?: UIUtil.getFocusedFillColor()
         val background = when {
-            isFlashing -> mix(base, accent, 0.16f)
-            isSelected -> mix(base, accent, 0.10f)
-            else -> elevate(base, 0.035f)
+            isFlashing -> mix(base, accent, if (isDarkTheme()) 0.16f else 0.10f)
+            isSelected -> mix(base, accent, if (isDarkTheme()) 0.10f else 0.06f)
+            else -> base
         }
         val borderColor = when {
             isFlashing -> accent
             isSelected -> mix(base, accent, 0.60f)
-            else -> JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()
+            else -> cardBorder()
         }
         view.root.background = background
         view.root.border = BorderFactory.createCompoundBorder(
             JBUI.Borders.customLine(borderColor, if (isSelected || isFlashing) 2 else 1),
             JBUI.Borders.empty()
         )
-        view.stripe.background = if (isSelected || isFlashing) accent else mix(base, borderColor, 0.14f)
+        view.stripe.background = if (isSelected || isFlashing) accent else mix(background, borderColor, 0.28f)
         view.stripe.isOpaque = true
     }
 
@@ -952,6 +959,33 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     private fun elevate(base: Color, amount: Float): Color {
         val target = if (base.red + base.green + base.blue < 384) Color.WHITE else Color.BLACK
         return mix(base, target, amount)
+    }
+
+    private fun isDarkTheme(): Boolean =
+        luminance(UIUtil.getPanelBackground()) < luminance(UIUtil.getLabelForeground())
+
+    private fun panelSurface(): Color =
+        if (isDarkTheme()) UIUtil.getPanelBackground() else Color(0xF6F8FA)
+
+    private fun cardSurface(): Color =
+        if (isDarkTheme()) elevate(UIUtil.getPanelBackground(), 0.035f) else Color.WHITE
+
+    private fun inputSurface(): Color =
+        if (isDarkTheme()) UIUtil.getPanelBackground() else Color.WHITE
+
+    private fun cardBorder(): Color =
+        if (isDarkTheme()) {
+            JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()
+        } else {
+            Color(0xD0D7DE)
+        }
+
+    private fun luminance(color: Color): Double {
+        fun channel(value: Int): Double {
+            val normalized = value / 255.0
+            return if (normalized <= 0.03928) normalized / 12.92 else Math.pow((normalized + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue)
     }
 
     companion object {
