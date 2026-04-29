@@ -30,9 +30,12 @@ object CommentDraftFactory {
             val selection = selection(editor)
             return CommentDraft(
                 file = newPath,
+                side = "new",
                 startLine = selection.startLine,
                 endLine = selection.endLine,
-                codeSnippet = codeSnippet(editor, selection.startLine, selection.endLine),
+                startColumn = selection.startColumn,
+                endColumn = selection.endColumn,
+                codeSnippet = codeSnippet(editor, selection),
                 reviewTargetRef = diffTarget.targetRef,
                 diffBaseCommit = diffTarget.mergeBaseCommit,
                 diffHeadCommit = diffTarget.headCommit,
@@ -54,17 +57,23 @@ object CommentDraftFactory {
 
         return CommentDraft(
             file = relPath,
+            side = "new",
             startLine = selection.startLine,
             endLine = selection.endLine,
-            codeSnippet = codeSnippet(editor, selection.startLine, selection.endLine)
+            startColumn = selection.startColumn,
+            endColumn = selection.endColumn,
+            codeSnippet = codeSnippet(editor, selection)
         )
     }
 
     fun fromComment(project: Project, comment: ReviewComment): CommentDraft =
         CommentDraft(
             file = comment.file,
+            side = comment.side,
             startLine = comment.startLine,
             endLine = comment.endLine,
+            startColumn = comment.startColumn,
+            endColumn = comment.endColumn,
             codeSnippet = currentSnippet(project, comment) ?: comment.codeSnippet,
             initialComment = comment.comment,
             existingCommentId = comment.id,
@@ -78,28 +87,39 @@ object CommentDraftFactory {
     private fun selection(editor: Editor): LineSelection {
         val document = editor.document
         val selectionModel = editor.selectionModel
-        val (startLine, endLine) = if (selectionModel.hasSelection()) {
-            val start = document.getLineNumber(selectionModel.selectionStart) + 1
-            val selectionEnd = selectionModel.selectionEnd
-            val endLineIndex = document.getLineNumber(
-                if (selectionEnd > 0 && selectionEnd == document.getLineStartOffset(document.getLineNumber(selectionEnd))) {
-                    selectionEnd - 1
-                } else {
-                    selectionEnd
-                }
-            ) + 1
-            start to endLineIndex
+        if (selectionModel.hasSelection()) {
+            val selectionStart = selectionModel.selectionStart
+            val rawSelectionEnd = selectionModel.selectionEnd
+            val adjustedSelectionEnd = if (
+                rawSelectionEnd > selectionStart &&
+                rawSelectionEnd > 0 &&
+                rawSelectionEnd == document.getLineStartOffset(document.getLineNumber(rawSelectionEnd))
+            ) {
+                rawSelectionEnd - 1
+            } else {
+                rawSelectionEnd
+            }
+            val startLineIndex = document.getLineNumber(selectionStart)
+            val endLineIndex = document.getLineNumber(adjustedSelectionEnd)
+            val exclusiveEndOffset = rawSelectionEnd.coerceAtLeast(selectionStart + 1)
+            return LineSelection(
+                startLine = startLineIndex + 1,
+                endLine = endLineIndex + 1,
+                startColumn = selectionStart - document.getLineStartOffset(startLineIndex) + 1,
+                endColumn = exclusiveEndOffset - document.getLineStartOffset(endLineIndex) + 1
+            )
         } else {
             val line = document.getLineNumber(editor.caretModel.offset) + 1
-            line to line
+            return LineSelection(line, line, null, null)
         }
-        return LineSelection(startLine, endLine)
     }
 
-    private fun codeSnippet(editor: Editor, startLine: Int, endLine: Int): String {
+    private fun codeSnippet(editor: Editor, selection: LineSelection): String {
         val document = editor.document
+        val selectedRange = selectedTextRange(editor, selection)
+        if (selectedRange != null) return document.getText(selectedRange)
         return buildString {
-            for (line in startLine..endLine) {
+            for (line in selection.startLine..selection.endLine) {
                 val index = line - 1
                 if (index !in 0 until document.lineCount) continue
                 append(
@@ -107,9 +127,24 @@ object CommentDraftFactory {
                         TextRange(document.getLineStartOffset(index), document.getLineEndOffset(index))
                     )
                 )
-                if (line != endLine) append('\n')
+                if (line != selection.endLine) append('\n')
             }
         }
+    }
+
+    private fun selectedTextRange(editor: Editor, selection: LineSelection): TextRange? {
+        val startColumn = selection.startColumn ?: return null
+        val endColumn = selection.endColumn ?: return null
+        val document = editor.document
+        val startLineIndex = selection.startLine - 1
+        val endLineIndex = selection.endLine - 1
+        if (startLineIndex !in 0 until document.lineCount || endLineIndex !in 0 until document.lineCount) return null
+        val startOffset = (document.getLineStartOffset(startLineIndex) + startColumn - 1)
+            .coerceIn(document.getLineStartOffset(startLineIndex), document.getLineEndOffset(startLineIndex))
+        val endOffset = (document.getLineStartOffset(endLineIndex) + endColumn - 1)
+            .coerceIn(document.getLineStartOffset(endLineIndex), document.getLineEndOffset(endLineIndex))
+        if (endOffset <= startOffset) return null
+        return TextRange(startOffset, endOffset)
     }
 
     private fun currentSnippet(project: Project, comment: ReviewComment): String? {
@@ -122,6 +157,15 @@ object CommentDraftFactory {
 
         val startLine = (comment.startLine - 1).coerceIn(0, document.lineCount - 1)
         val endLine = (comment.endLine - 1).coerceIn(startLine, document.lineCount - 1)
+        val startColumn = comment.startColumn
+        val endColumn = comment.endColumn
+        if (startColumn != null && endColumn != null) {
+            val startOffset = (document.getLineStartOffset(startLine) + startColumn - 1)
+                .coerceIn(document.getLineStartOffset(startLine), document.getLineEndOffset(startLine))
+            val endOffset = (document.getLineStartOffset(endLine) + endColumn - 1)
+                .coerceIn(document.getLineStartOffset(endLine), document.getLineEndOffset(endLine))
+            if (endOffset > startOffset) return document.getText(TextRange(startOffset, endOffset))
+        }
         return buildString {
             for (lineIndex in startLine..endLine) {
                 append(
@@ -134,5 +178,10 @@ object CommentDraftFactory {
         }
     }
 
-    private data class LineSelection(val startLine: Int, val endLine: Int)
+    private data class LineSelection(
+        val startLine: Int,
+        val endLine: Int,
+        val startColumn: Int?,
+        val endColumn: Int?
+    )
 }

@@ -84,6 +84,11 @@
 | `UpdatedAt` | string | 更新时间（RFC3339） |
 | `CreatedBy` | object | 作者简要信息（不是完整 user profile） |
 
+`Content` 可承载 Markdown 图片语法。当前插件本地图片以
+`![image](.code-review/assets/...)` 形式存入 local JSON；同步到远端前若要
+在 GitLab / code.byted.org 正常显示，需要先把本地图片上传为远端可访问 URL，
+再替换正文中的本地路径。
+
 ### CreatedBy（作者引用）
 
 | 字段 | 类型 | 说明 |
@@ -102,9 +107,9 @@
   "NewCommitId": "...",
   "Path": "internal/platform/approval/models.go",
   "StartLine": 313,
-  "StartColumn": null,
+  "StartColumn": 12,
   "EndLine": 313,
-  "EndColumn": null
+  "EndColumn": 28
 }
 ```
 
@@ -116,9 +121,13 @@
 | `NewCommitId` | string | new side 对应的 commit id |
 | `Path` | string | 文件路径（repo 相对路径） |
 | `StartLine` | number | 起始行（1-based） |
-| `StartColumn` | number\|null | 起始列（1-based；观测到可能为 `null`） |
+| `StartColumn` | number\|null | 起始列（1-based；整行评论可能为 `null`） |
 | `EndLine` | number | 结束行（1-based） |
-| `EndColumn` | number\|null | 结束列（1-based；观测到可能为 `null`） |
+| `EndColumn` | number\|null | 结束列（1-based；整行评论可能为 `null`；精确选区时按 end-exclusive 范围处理） |
+
+插件本地 schema 现在会在用户选中文本创建 comment 时保存
+`startColumn/endColumn`，用于和这里的 `StartColumn/EndColumn` 做双向映射。
+只有光标所在行创建的整行 comment 才保持列号为 `null`。
 
 ### TruncatedDiff（上下文 diff 片段）
 
@@ -157,8 +166,8 @@
     "Side": "new",
     "StartLine": 313,
     "EndLine": 313,
-    "StartColumn": 1,
-    "EndColumn": 1
+    "StartColumn": 12,
+    "EndColumn": 28
   }
 }
 ```
@@ -166,7 +175,7 @@
 关键点：
 
 - **回复现有 thread**：设置 `Comment.ThreadId`。此时文件定位字段（`FilePath/Side/StartLine/...`）会被忽略。
-- **创建新 thread（inline comment）**：不设置 `ThreadId`，改为提供文件定位字段（`FilePath` + `Side` + 行列范围）。
+- **创建新 thread（inline comment）**：不设置 `ThreadId`，改为提供文件定位字段（`FilePath` + `Side` + 行范围，若是精确选区则同时提供列范围）。
 
 字段语义（来自 tool schema）：
 
@@ -181,7 +190,7 @@
 | `Comment.FilePath` | 可选：创建新 thread 时需要的文件路径 |
 | `Comment.Side` | 可选：`old` 或 `new`，默认 `new` |
 | `Comment.StartLine` / `EndLine` | 可选：行号（1-based） |
-| `Comment.StartColumn` / `EndColumn` | 可选：列号（1-based） |
+| `Comment.StartColumn` / `EndColumn` | 可选：列号（1-based）；精确选区评论使用，整行评论可省略或传 `null` |
 
 ---
 
@@ -191,5 +200,5 @@
 
 - Thread 主键：优先用 `Thread.Id`；外部系统可维护 `external_thread_id <-> codebase_thread_id` 映射。
 - Comment 主键：用 `Comment.Id`；同理维护 `external_comment_id <-> codebase_comment_id`。
-- 位置锚点：用 `Thread.Position`（`Path + Side + Start/EndLine(+Column) + Old/NewCommitId`）作为「线程落点」的可比对信息。
+- 位置锚点：用 `Thread.Position`（`Path + Side + Start/EndLine(+Column) + Old/NewCommitId`）作为「线程落点」的可比对信息；列号为空表示整行锚点，列号非空表示文本范围锚点。
 - 状态同步：用 `Thread.Status`（`open/resolved`）做线程级状态；comment 本身未观测到独立的 open/resolve 字段。

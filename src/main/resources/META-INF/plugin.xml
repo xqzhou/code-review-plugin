@@ -42,7 +42,8 @@
             <add-to-group group-id="EditorPopupMenu" anchor="first"/>
             <add-to-group group-id="Diff.EditorPopupMenu" anchor="first"/>
             <add-to-group group-id="Diff.ViewerPopupMenu" anchor="first"/>
-            <keyboard-shortcut keymap="$default" first-keystroke="shift meta M"/>
+            <keyboard-shortcut keymap="Mac OS X" first-keystroke="shift meta M"/>
+            <keyboard-shortcut keymap="Mac OS X 10.5+" first-keystroke="shift meta M"/>
         </action>
     </actions>
 </idea-plugin>

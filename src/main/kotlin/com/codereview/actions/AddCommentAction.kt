@@ -8,10 +8,16 @@ import com.intellij.diff.tools.util.DiffDataKeys
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.actionSystem.KeyboardShortcut
 import com.intellij.openapi.components.service
 import com.intellij.openapi.actionSystem.CommonDataKeys
+import com.intellij.openapi.keymap.KeymapManager
 
 class AddCommentAction : AnAction("Add Review Comment") {
+
+    init {
+        normalizeShortcut()
+    }
 
     override fun getActionUpdateThread(): ActionUpdateThread = ActionUpdateThread.BGT
 
@@ -43,5 +49,25 @@ class AddCommentAction : AnAction("Add Review Comment") {
         val draft = CommentDraftFactory.fromEvent(project, e) ?: return
         project.service<CommentEditorDecorations>()
         CommentToolWindowService.getInstance(project).showDraft(draft)
+    }
+
+    companion object {
+        private const val ACTION_ID = "CodeReview.AddComment"
+        private val commandShiftM = KeyboardShortcut.fromString("shift meta M")
+        private val controlShiftM = KeyboardShortcut.fromString("shift ctrl M")
+
+        private fun normalizeShortcut() {
+            runCatching {
+                val keymap = KeymapManager.getInstance().activeKeymap
+                if (!keymap.canModify()) return
+                val shortcuts = keymap.getShortcuts(ACTION_ID).toSet()
+                if (shortcuts.contains(controlShiftM)) {
+                    keymap.removeShortcut(ACTION_ID, controlShiftM)
+                }
+                if (!shortcuts.contains(commandShiftM)) {
+                    keymap.addShortcut(ACTION_ID, commandShiftM)
+                }
+            }
+        }
     }
 }

@@ -2,13 +2,14 @@
 
 This document defines the local `.code-review/<branch>.json` schema used by the
 plugin. It is intentionally smaller than the observed code.byted.org /
-GitLab-style MR comment schema in [mr-comment-schema.md](./mr-comment-schema.md).
+GitLab-style MR comment schema in [gitlab-comment-schema.md](./gitlab-comment-schema.md).
 
 The local model is **thread-first**:
 
 - one `ReviewThread` represents one anchored MR discussion
 - one or more `ReviewComment` entries live inside that thread
 - line / diff position data exists only on the thread
+- column data is optional and is present for text-range comments
 - replies do not duplicate anchor metadata
 
 ## Top-level JSON
@@ -37,8 +38,8 @@ The local model is **thread-first**:
   "side": "new",
   "startLine": 148,
   "endLine": 150,
-  "startColumn": null,
-  "endColumn": null,
+  "startColumn": 9,
+  "endColumn": 21,
   "createdAt": "2026-04-24T04:07:12Z",
   "updatedAt": "2026-04-24T04:07:12Z",
   "status": "open",
@@ -62,6 +63,12 @@ The local model is **thread-first**:
 - `file`: repo-relative display path for the anchor
 - `side`: currently `new` in plugin-created comments; `old` is reserved for
   future compatibility
+- `startLine` / `endLine`: 1-based inclusive line range for the anchor
+- `startColumn` / `endColumn`: optional 1-based text range columns. They are
+  non-null when the user selected text before creating the comment, and null
+  for whole-line comments created from only a caret position. `endColumn` is
+  exclusive, matching IntelliJ editor selection offsets and GitLab-style
+  position ranges.
 - `status`: `open` or `resolved`
 - `outdated`: thread-level outdated state
 - `reviewTargetRef`: always store as `origin/<target-branch>`
@@ -91,6 +98,10 @@ The local model is **thread-first**:
 
 - `threadId`: always points to the parent thread
 - `content`: plain comment body
+- `content` may include Markdown image references such as
+  `![image](.code-review/assets/<branch>/comment-image-....png)`. The plugin
+  stores pasted / attached local images under `.code-review/assets/` and renders
+  those references as image previews in the comments panel.
 - `createdByName`: used by the plugin for local ownership checks
 - `createdByUsername`: optional; useful for stricter sync ownership later
 - `remoteCommentId`: remote note / comment id
@@ -148,8 +159,12 @@ Send:
 - `Comment.Side` = `ReviewThread.side`
 - `Comment.StartLine` = `ReviewThread.startLine`
 - `Comment.EndLine` = `ReviewThread.endLine`
-- `Comment.StartColumn` = `ReviewThread.startColumn ?: 1`
-- `Comment.EndColumn` = `ReviewThread.endColumn ?: 1`
+- `Comment.StartColumn` = `ReviewThread.startColumn` when non-null
+- `Comment.EndColumn` = `ReviewThread.endColumn` when non-null
+
+For whole-line local comments, leave `StartColumn` / `EndColumn` unset or null
+when the remote API accepts omitted column fields. Only fall back to `1` if the
+remote create API requires numeric column values for inline comments.
 
 On success, write back:
 
@@ -213,6 +228,8 @@ The plugin does **not** persist these remote-only fields in local JSON:
 - `RawPatch`
 - full `CreatedBy` object
 - `VersionNumber`
+- separate image attachment metadata; local images are represented only by
+  Markdown references in `ReviewComment.content`
 
 The skill should derive those from MR context and remote API responses instead
 of storing them in plugin-owned local state.

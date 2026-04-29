@@ -24,9 +24,9 @@ class CommentToolWindowService(private val project: Project) {
         openAndRun { beginDraft(draft) }
     }
 
-    fun showComment(commentId: String) {
+    fun showComment(commentId: String, alignmentFraction: Double? = null) {
         CommentSelectionService.getInstance(project).select(commentId)
-        openAndRun { selectComment(commentId) }
+        openAndRun { selectComment(commentId, alignmentFraction) }
     }
 
     fun editComment(commentId: String) {

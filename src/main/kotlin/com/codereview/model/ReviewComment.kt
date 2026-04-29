@@ -40,6 +40,9 @@ data class ReviewComment(
     var file: String = ""
 
     @Transient
+    var side: String = "new"
+
+    @Transient
     var startLine: Int = 1
 
     @Transient

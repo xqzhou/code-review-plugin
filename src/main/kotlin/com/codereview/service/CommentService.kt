@@ -62,6 +62,9 @@ class CommentService(private val project: Project) {
         endLine: Int,
         codeSnippet: String,
         comment: String,
+        side: String = "new",
+        startColumn: Int? = null,
+        endColumn: Int? = null,
         reviewTargetRef: String? = null,
         diffBaseCommit: String? = null,
         diffHeadCommit: String? = null,
@@ -70,8 +73,11 @@ class CommentService(private val project: Project) {
     ): ReviewComment =
         addThread(
             file = file,
+            side = side,
             startLine = startLine,
             endLine = endLine,
+            startColumn = startColumn,
+            endColumn = endColumn,
             codeSnippet = codeSnippet,
             comment = comment,
             reviewTargetRef = reviewTargetRef,
@@ -87,6 +93,9 @@ class CommentService(private val project: Project) {
         endLine: Int,
         codeSnippet: String,
         comment: String,
+        side: String = "new",
+        startColumn: Int? = null,
+        endColumn: Int? = null,
         reviewTargetRef: String? = null,
         diffBaseCommit: String? = null,
         diffHeadCommit: String? = null,
@@ -100,9 +109,11 @@ class CommentService(private val project: Project) {
         val thread = ReviewThread(
             id = threadId,
             file = file,
-            side = "new",
+            side = side.ifBlank { "new" },
             startLine = startLine,
             endLine = endLine.coerceAtLeast(startLine),
+            startColumn = startColumn,
+            endColumn = endColumn,
             createdAt = now,
             updatedAt = now,
             status = "open",
@@ -266,6 +277,7 @@ class CommentService(private val project: Project) {
         comment.apply {
             threadId = thread.id
             file = thread.file
+            side = thread.side
             startLine = thread.startLine
             endLine = thread.endLine
             startColumn = thread.startColumn
@@ -287,6 +299,7 @@ class CommentService(private val project: Project) {
     private fun copyComment(comment: ReviewComment): ReviewComment =
         comment.copy().also { copy ->
             copy.file = comment.file
+            copy.side = comment.side
             copy.startLine = comment.startLine
             copy.endLine = comment.endLine
             copy.startColumn = comment.startColumn

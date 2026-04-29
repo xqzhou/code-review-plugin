@@ -29,6 +29,8 @@ import com.intellij.openapi.Disposable
 import com.intellij.openapi.actionSystem.ActionUpdateThread
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
+import com.intellij.openapi.editor.Document
+import com.intellij.openapi.editor.LogicalPosition
 import com.intellij.openapi.editor.colors.EditorColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.ex.EditorEx
@@ -574,13 +576,8 @@ class MrReviewFileEditor(
             val selectedAttributes = rangeAttributes(selected = true)
 
             comments.forEach { comment ->
-                val startLineIndex = (comment.startLine - 1).coerceAtLeast(0)
-                val endLineIndex = (comment.endLine - 1).coerceAtLeast(startLineIndex)
-                if (startLineIndex !in 0 until editor.document.lineCount) return@forEach
-
-                val safeEndLine = endLineIndex.coerceAtMost(editor.document.lineCount - 1)
-                val startOffset = editor.document.getLineStartOffset(startLineIndex)
-                val endOffset = editor.document.getLineEndOffset(safeEndLine)
+                val offsets = commentRangeOffsets(editor.document, comment) ?: return@forEach
+                val (startOffset, endOffset) = offsets
 
                 editor.markupModel.addRangeHighlighter(
                     startOffset,
@@ -615,7 +612,7 @@ class MrReviewFileEditor(
                     if (lineIndex !in 0 until editor.document.lineCount) return@forEach
                     editor.markupModel.addLineHighlighter(lineIndex, HighlighterLayer.ADDITIONAL_SYNTAX, null).apply {
                         putUserData(lineMarkerKey, true)
-                        gutterIconRenderer = CommentGutterRenderer(project, commentIcon, groupedComments)
+                        gutterIconRenderer = CommentGutterRenderer(project, editor, lineIndex, commentIcon, groupedComments)
                         errorStripeTooltip = groupedComments.joinToString("\n\n") { tooltipFor(it) }
                     }
                 }
@@ -981,7 +978,37 @@ class MrReviewFileEditor(
     }
 
     private fun tooltipFor(comment: ReviewComment): String =
-        "[${comment.startLine}-${comment.endLine}] ${comment.comment}"
+        "[${rangeLabel(comment)}] ${comment.comment}"
+
+    private fun commentRangeOffsets(document: Document, comment: ReviewComment): Pair<Int, Int>? {
+        if (document.lineCount <= 0) return null
+        val startLineIndex = (comment.startLine - 1).coerceAtLeast(0)
+        if (startLineIndex !in 0 until document.lineCount) return null
+        val endLineIndex = (comment.endLine - 1).coerceAtLeast(startLineIndex).coerceAtMost(document.lineCount - 1)
+
+        val startOffset = if (comment.startColumn != null) {
+            val lineStart = document.getLineStartOffset(startLineIndex)
+            val lineEnd = document.getLineEndOffset(startLineIndex)
+            (lineStart + comment.startColumn!! - 1).coerceIn(lineStart, lineEnd)
+        } else {
+            document.getLineStartOffset(startLineIndex)
+        }
+
+        val endOffset = if (comment.endColumn != null) {
+            val lineStart = document.getLineStartOffset(endLineIndex)
+            val lineEnd = document.getLineEndOffset(endLineIndex)
+            (lineStart + comment.endColumn!! - 1).coerceIn(lineStart, lineEnd)
+        } else {
+            document.getLineEndOffset(endLineIndex)
+        }
+
+        return if (endOffset > startOffset) {
+            startOffset to endOffset
+        } else {
+            val fallbackEnd = document.getLineEndOffset(endLineIndex)
+            if (fallbackEnd > startOffset) startOffset to fallbackEnd else null
+        }
+    }
 
     private fun rangeAttributes(selected: Boolean): TextAttributes {
         val scheme = EditorColorsManager.getInstance().globalScheme
@@ -1042,7 +1069,6 @@ class MrReviewFileEditor(
                     val change = node.change
                     val path = change.displayPath()
                     val fileName = path.substringAfterLast('/')
-                    val parent = path.substringBeforeLast('/', "")
                     icon = fileIcon(fileName)
                     append(fileName, SimpleTextAttributes.REGULAR_ATTRIBUTES)
                     if (change.addedLines > 0 || change.removedLines > 0) {
@@ -1051,11 +1077,6 @@ class MrReviewFileEditor(
                         append(" ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
                         append("-${change.removedLines}", SimpleTextAttributes(SimpleTextAttributes.STYLE_PLAIN, negative))
                     }
-                    append("  ", SimpleTextAttributes.REGULAR_ATTRIBUTES)
-                    append(change.statusLetter(), SimpleTextAttributes.GRAYED_ATTRIBUTES)
-                    if (parent.isNotBlank()) {
-                        append(" • $parent", SimpleTextAttributes.GRAYED_SMALL_ATTRIBUTES)
-                    }
                 }
             }
         }
@@ -1063,6 +1084,8 @@ class MrReviewFileEditor(
 
     private class CommentGutterRenderer(
         private val project: Project,
+        private val editor: EditorEx,
+        private val lineIndex: Int,
         private val icon: javax.swing.Icon,
         private val comments: List<ReviewComment>
     ) : GutterIconRenderer() {
@@ -1070,7 +1093,7 @@ class MrReviewFileEditor(
         override fun getIcon(): javax.swing.Icon = icon
 
         override fun getTooltipText(): String =
-            comments.joinToString("\n") { "[${it.startLine}-${it.endLine}] ${it.comment}" }
+            comments.joinToString("\n") { "[${rangeLabel(it)}] ${it.comment}" }
 
         override fun getAlignment(): Alignment = Alignment.LEFT
 
@@ -1079,7 +1102,7 @@ class MrReviewFileEditor(
 
             override fun actionPerformed(e: AnActionEvent) {
                 val first = comments.firstOrNull() ?: return
-                CommentToolWindowService.getInstance(project).showComment(first.id)
+                CommentToolWindowService.getInstance(project).showComment(first.id, editorLineAlignmentFraction(editor, lineIndex))
             }
         }
 
@@ -1090,6 +1113,13 @@ class MrReviewFileEditor(
         }
 
         override fun hashCode(): Int = comments.map { it.id }.hashCode()
+
+        private fun editorLineAlignmentFraction(editor: EditorEx, lineIndex: Int): Double {
+            val visibleArea = editor.scrollingModel.visibleArea
+            if (visibleArea.height <= 0) return 0.0
+            val y = editor.logicalPositionToXY(LogicalPosition(lineIndex, 0)).y
+            return ((y - visibleArea.y).toDouble() / visibleArea.height).coerceIn(0.0, 1.0)
+        }
     }
 
     private fun fileIcon(fileName: String) =
@@ -1098,16 +1128,20 @@ class MrReviewFileEditor(
     private fun MrReviewChange.displayPath(): String =
         newPath ?: oldPath ?: "unknown"
 
-    private fun MrReviewChange.statusLetter(): String =
-        when {
-            status.startsWith("A") -> "A"
-            status.startsWith("D") -> "D"
-            status.startsWith("R") -> "R"
-            status.startsWith("C") -> "C"
-            else -> "M"
+    companion object {
+        private fun rangeLabel(comment: ReviewComment): String {
+            val startColumn = comment.startColumn
+            val endColumn = comment.endColumn
+            if (startColumn != null && endColumn != null) {
+                return if (comment.startLine == comment.endLine) {
+                    "${comment.startLine}:$startColumn-$endColumn"
+                } else {
+                    "${comment.startLine}:$startColumn-${comment.endLine}:$endColumn"
+                }
+            }
+            return "${comment.startLine}-${comment.endLine}"
         }
 
-    companion object {
         private val DIFF_NAVIGATION_ACTION_IDS = setOf(
             "PreviousDiff",
             "NextDiff",
