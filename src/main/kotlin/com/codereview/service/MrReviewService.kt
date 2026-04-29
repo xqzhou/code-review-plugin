@@ -121,14 +121,17 @@ class MrReviewService(private val project: Project) {
         return true
     }
 
-    fun navigateToComment(commentId: String): Boolean {
+    fun navigateToComment(commentId: String, requestFocus: Boolean = true): Boolean {
         val comment = CommentService.getInstance(project).find(commentId) ?: return false
-        return navigateToComment(comment)
+        return navigateToComment(comment, requestFocus)
     }
 
-    fun navigateToComment(comment: ReviewComment): Boolean {
+    fun navigateToComment(comment: ReviewComment, requestFocus: Boolean = true): Boolean {
+        val sessionTarget = sessionTargetFor(comment)
         currentSession?.let { active ->
-            val canUseActiveSession = if (comment.reviewTargetRef != null && comment.diffHeadCommit != null) {
+            val canUseActiveSession = if (sessionTarget != null) {
+                matchesSession(active, sessionTarget.targetRef, sessionTarget.baseCommit, sessionTarget.headCommit)
+            } else if (comment.reviewTargetRef != null && comment.diffHeadCommit != null) {
                 matchesSession(active, comment.reviewTargetRef, comment.diffBaseCommit, comment.diffHeadCommit)
             } else {
                 true
@@ -136,28 +139,38 @@ class MrReviewService(private val project: Project) {
             if (canUseActiveSession) {
                 val activeIndex = findChangeIndex(active, comment.diffOldPath, comment.diffNewPath, comment.file)
                 if (activeIndex >= 0) {
-                    showSession(active, ReviewNavigation(activeIndex, comment.startLine))
+                    showSession(active, ReviewNavigation(activeIndex, comment.startLine), requestFocus)
                     return true
                 }
             }
         }
 
-        val targetRef = comment.reviewTargetRef ?: return false
-        val headCommit = comment.diffHeadCommit ?: return false
-        val session = ensureSession(targetRef, comment.diffBaseCommit, headCommit, warnOnFailure = false) ?: return false
+        val targetRef = sessionTarget?.targetRef ?: comment.reviewTargetRef ?: return false
+        val headCommit = sessionTarget?.headCommit ?: comment.diffHeadCommit ?: return false
+        val baseCommit = sessionTarget?.baseCommit ?: comment.diffBaseCommit
+        val session = ensureSession(targetRef, baseCommit, headCommit, warnOnFailure = false) ?: return false
         val index = findChangeIndex(session, comment.diffOldPath, comment.diffNewPath, comment.file)
         if (index < 0) return false
-        showSession(session, ReviewNavigation(index, comment.startLine))
+        showSession(session, ReviewNavigation(index, comment.startLine), requestFocus)
         return true
     }
 
-    fun navigateToDraft(draft: CommentDraft): Boolean {
+    private fun sessionTargetFor(comment: ReviewComment): SessionTarget? {
+        val branchData = store.load()
+        val reviewContext = validateReviewContext(branchData, warnOnFailure = false) ?: return null
+        val headCommit = reviewContext.headCommit ?: return null
+        if (comment.reviewTargetRef != null && comment.reviewTargetRef != reviewContext.targetRef) return null
+        if (comment.diffHeadCommit != null && comment.diffHeadCommit != headCommit) return null
+        return SessionTarget(reviewContext.targetRef, reviewContext.baseCommit, headCommit)
+    }
+
+    fun navigateToDraft(draft: CommentDraft, requestFocus: Boolean = true): Boolean {
         val targetRef = draft.reviewTargetRef ?: return false
         val headCommit = draft.diffHeadCommit ?: return false
         val session = ensureSession(targetRef, draft.diffBaseCommit, headCommit, warnOnFailure = false) ?: return false
         val index = findChangeIndex(session, draft.diffOldPath, draft.diffNewPath, draft.file)
         if (index < 0) return false
-        showSession(session, ReviewNavigation(index, draft.startLine))
+        showSession(session, ReviewNavigation(index, draft.startLine), requestFocus)
         return true
     }
 
@@ -245,14 +258,14 @@ class MrReviewService(private val project: Project) {
         return prepared
     }
 
-    private fun showSession(session: MrReviewSession, navigation: ReviewNavigation?) {
+    private fun showSession(session: MrReviewSession, navigation: ReviewNavigation?, requestFocus: Boolean = true) {
         val previousSessionKey = currentSession?.sessionKey
         currentSession = session
         currentNavigation = navigation
         if (previousSessionKey != null && previousSessionKey != session.sessionKey) {
             diffBackStack.clear()
         }
-        openReviewFile(session, navigation)
+        openReviewFile(session, navigation, requestFocus)
         project.messageBus.syncPublisher(TOPIC).onReviewSessionChanged(currentSession, currentNavigation)
     }
 
@@ -260,7 +273,7 @@ class MrReviewService(private val project: Project) {
         diffBackStack.addLast(navigation)
     }
 
-    private fun openReviewFile(session: MrReviewSession, navigation: ReviewNavigation?) {
+    private fun openReviewFile(session: MrReviewSession, navigation: ReviewNavigation?, requestFocus: Boolean) {
         ApplicationManager.getApplication().invokeLater {
             val manager = FileEditorManager.getInstance(project)
             val nextFile = reviewFile(session)
@@ -269,7 +282,7 @@ class MrReviewService(private val project: Project) {
                 manager.closeFile(previous)
             }
             reviewFile = nextFile
-            val editors = manager.openFile(nextFile, true)
+            val editors = manager.openFile(nextFile, requestFocus)
             editors.filterIsInstance<com.codereview.mr.MrReviewFileEditor>().forEach { editor ->
                 editor.applySession(session, navigation)
             }
@@ -313,7 +326,9 @@ class MrReviewService(private val project: Project) {
             mrId = data.mrId,
             title = data.title,
             sourceBranch = sourceBranch,
-            targetRef = targetRef
+            targetRef = targetRef,
+            baseCommit = data.baseCommit?.takeIf { it.isNotBlank() },
+            headCommit = data.headCommit?.takeIf { it.isNotBlank() }
         )
     }
 
@@ -328,8 +343,10 @@ class MrReviewService(private val project: Project) {
         }
 
         val headCommit = headCommitOverride?.takeIf { canResolve(repository, it) }
+            ?: context.headCommit?.takeIf { canResolve(repository, it) }
             ?: git(repository, GitCommand.REV_PARSE, "HEAD").singleLine("Could not resolve `HEAD`.")
         val baseCommit = baseCommitOverride?.takeIf { canResolve(repository, it) }
+            ?: context.baseCommit?.takeIf { canResolve(repository, it) }
             ?: git(repository, GitCommand.MERGE_BASE, context.targetRef, headCommit)
                 .singleLine("Could not resolve merge-base for `${context.targetRef}`.")
 
@@ -634,7 +651,15 @@ class MrReviewService(private val project: Project) {
         val mrId: String?,
         val title: String?,
         val sourceBranch: String,
-        val targetRef: String
+        val targetRef: String,
+        val baseCommit: String?,
+        val headCommit: String?
+    )
+
+    private data class SessionTarget(
+        val targetRef: String,
+        val baseCommit: String?,
+        val headCommit: String
     )
 
     companion object {

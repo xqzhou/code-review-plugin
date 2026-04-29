@@ -162,7 +162,7 @@ class CommentEditorDecorations(private val project: Project) {
         val endOffset = if (comment.endColumn != null) {
             val lineStart = document.getLineStartOffset(endLineIndex)
             val lineEnd = document.getLineEndOffset(endLineIndex)
-            (lineStart + comment.endColumn!! - 1).coerceIn(lineStart, lineEnd)
+            (lineStart + comment.endColumn!!).coerceIn(lineStart, lineEnd)
         } else {
             document.getLineEndOffset(endLineIndex)
         }
@@ -177,8 +177,9 @@ class CommentEditorDecorations(private val project: Project) {
 
     private fun rangeAttributes(selected: Boolean): TextAttributes {
         val scheme = EditorColorsManager.getInstance().globalScheme
-        val accent = scheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR) ?: UIUtil.getFocusedFillColor()
-        val background = mix(scheme.defaultBackground ?: UIUtil.getEditorPaneBackground(), accent, if (selected) 0.42f else 0.14f)
+        val base = scheme.defaultBackground ?: UIUtil.getEditorPaneBackground()
+        val accent = if (selected) selectedCommentAccent() else passiveCommentAccent()
+        val background = mix(base, accent, if (selected) 0.58f else 0.20f)
         return TextAttributes().apply {
             backgroundColor = background
             if (selected) {
@@ -188,6 +189,12 @@ class CommentEditorDecorations(private val project: Project) {
         }
     }
 
+    private fun selectedCommentAccent(): Color =
+        if (isDarkTheme()) Color(0xD89B2B) else Color(0xF0B429)
+
+    private fun passiveCommentAccent(): Color =
+        if (isDarkTheme()) Color(0x7A8FA8) else Color(0x8EA9C1)
+
     private fun mix(base: Color, accent: Color, weight: Float): Color {
         val normalized = weight.coerceIn(0f, 1f)
         val inverse = 1f - normalized
@@ -196,6 +203,17 @@ class CommentEditorDecorations(private val project: Project) {
             (base.green * inverse + accent.green * normalized).toInt().coerceIn(0, 255),
             (base.blue * inverse + accent.blue * normalized).toInt().coerceIn(0, 255)
         )
+    }
+
+    private fun isDarkTheme(): Boolean =
+        mixLuminance(UIUtil.getPanelBackground()) < mixLuminance(UIUtil.getLabelForeground())
+
+    private fun mixLuminance(color: Color): Double {
+        fun channel(value: Int): Double {
+            val normalized = value / 255.0
+            return if (normalized <= 0.03928) normalized / 12.92 else Math.pow((normalized + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue)
     }
 
     companion object {

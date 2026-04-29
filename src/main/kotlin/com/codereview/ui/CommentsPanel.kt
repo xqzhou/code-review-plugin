@@ -1134,26 +1134,28 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun applyCardStyle(view: ThreadCardView, isSelected: Boolean, isFlashing: Boolean) {
         val base = cardSurface()
-        val accent = EditorColorsManager.getInstance().globalScheme.getColor(EditorColors.SELECTION_BACKGROUND_COLOR)
-            ?: UIUtil.getFocusedFillColor()
+        val accent = commentSelectionAccent()
         val background = when {
-            isFlashing -> mix(base, accent, if (isDarkTheme()) 0.16f else 0.10f)
-            isSelected -> mix(base, accent, if (isDarkTheme()) 0.10f else 0.06f)
+            isFlashing -> mix(base, accent, if (isDarkTheme()) 0.24f else 0.16f)
+            isSelected -> mix(base, accent, if (isDarkTheme()) 0.18f else 0.12f)
             else -> base
         }
         val borderColor = when {
             isFlashing -> accent
-            isSelected -> mix(base, accent, 0.60f)
+            isSelected -> mix(base, accent, 0.86f)
             else -> cardBorder()
         }
         view.root.background = background
         view.root.border = BorderFactory.createCompoundBorder(
-            JBUI.Borders.customLine(borderColor, if (isSelected || isFlashing) 2 else 1),
+            JBUI.Borders.customLine(borderColor, if (isSelected || isFlashing) 3 else 1),
             JBUI.Borders.empty()
         )
         view.stripe.background = if (isSelected || isFlashing) accent else mix(background, borderColor, 0.28f)
         view.stripe.isOpaque = true
     }
+
+    private fun commentSelectionAccent(): Color =
+        if (isDarkTheme()) Color(0xD89B2B) else Color(0xF0B429)
 
     private fun syncCardSelection(commentId: String?) {
         threadViews.forEach { (threadId, view) ->
@@ -1374,7 +1376,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
 
     private fun navigateToDraft(draft: CommentDraft) {
-        if (MrReviewService.getInstance(project).navigateToDraft(draft)) return
+        if (MrReviewService.getInstance(project).navigateToDraft(draft, requestFocus = false)) return
         val target = ProjectFiles.find(project, draft.file) ?: run {
             CommentNotifications.warn(project, "Comment Target Missing", "Cannot find `${draft.file}` in the current project.")
             return
@@ -1383,11 +1385,11 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             CommentNotifications.warn(project, "Comment Target Outdated", "`${draft.file}` no longer has line ${draft.startLine}.")
             return
         }
-        OpenFileDescriptor(project, target, lineIndex, columnIndex(draft.startColumn)).navigate(true)
+        OpenFileDescriptor(project, target, lineIndex, columnIndex(draft.startColumn)).navigate(false)
     }
 
     private fun navigateTo(comment: ReviewComment, requestFocusComment: Boolean) {
-        if (!comment.outdated && MrReviewService.getInstance(project).navigateToComment(comment)) {
+        if (!comment.outdated && MrReviewService.getInstance(project).navigateToComment(comment, requestFocus = false)) {
             if (requestFocusComment) selectComment(comment.id)
             return
         }
@@ -1399,7 +1401,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             CommentNotifications.warn(project, "Comment Target Outdated", "`${comment.file}` no longer has line ${comment.startLine}.")
             return
         }
-        OpenFileDescriptor(project, target, lineIndex, columnIndex(comment.startColumn)).navigate(true)
+        OpenFileDescriptor(project, target, lineIndex, columnIndex(comment.startColumn)).navigate(false)
         if (requestFocusComment) selectComment(comment.id)
     }
 

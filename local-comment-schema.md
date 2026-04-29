@@ -66,9 +66,10 @@ The local model is **thread-first**:
 - `startLine` / `endLine`: 1-based inclusive line range for the anchor
 - `startColumn` / `endColumn`: optional 1-based text range columns. They are
   non-null when the user selected text before creating the comment, and null
-  for whole-line comments created from only a caret position. `endColumn` is
-  exclusive, matching IntelliJ editor selection offsets and GitLab-style
-  position ranges.
+  for whole-line comments created from only a caret position. Both columns are
+  inclusive, matching code.byted.org / GitLab-style position ranges. The plugin
+  converts IntelliJ's exclusive selection end offset to this inclusive
+  `endColumn` when saving a local comment.
 - `status`: `open` or `resolved`
 - `outdated`: thread-level outdated state
 - `reviewTargetRef`: always store as `origin/<target-branch>`
@@ -123,8 +124,8 @@ The local model is **thread-first**:
 | `Thread.Position.EndLine` | `ReviewThread.endLine` |
 | `Thread.Position.StartColumn` | `ReviewThread.startColumn` |
 | `Thread.Position.EndColumn` | `ReviewThread.endColumn` |
-| `Thread.Position.OldCommitId` | `ReviewThread.diffBaseCommit` |
-| `Thread.Position.NewCommitId` | `ReviewThread.diffHeadCommit` |
+| `Thread.Position.OldCommitId` | `ReviewThread.diffBaseCommit` fallback only; prefer top-level `baseCommit` when staging pulled remote threads |
+| `Thread.Position.NewCommitId` | `ReviewThread.diffHeadCommit` fallback only; prefer top-level `headCommit` when staging pulled remote threads |
 | `Thread.Position.Path` | `ReviewThread.diffNewPath` by default |
 
 If the skill already knows a rename pair from the MR diff, it should populate:

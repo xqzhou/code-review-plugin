@@ -123,7 +123,7 @@
 | `StartLine` | number | 起始行（1-based） |
 | `StartColumn` | number\|null | 起始列（1-based；整行评论可能为 `null`） |
 | `EndLine` | number | 结束行（1-based） |
-| `EndColumn` | number\|null | 结束列（1-based；整行评论可能为 `null`；精确选区时按 end-exclusive 范围处理） |
+| `EndColumn` | number\|null | 结束列（1-based；整行评论可能为 `null`；精确选区时按 inclusive 范围处理） |
 
 插件本地 schema 现在会在用户选中文本创建 comment 时保存
 `startColumn/endColumn`，用于和这里的 `StartColumn/EndColumn` 做双向映射。

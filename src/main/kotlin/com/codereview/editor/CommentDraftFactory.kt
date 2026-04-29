@@ -102,11 +102,12 @@ object CommentDraftFactory {
             val startLineIndex = document.getLineNumber(selectionStart)
             val endLineIndex = document.getLineNumber(adjustedSelectionEnd)
             val exclusiveEndOffset = rawSelectionEnd.coerceAtLeast(selectionStart + 1)
+            val inclusiveEndOffset = (exclusiveEndOffset - 1).coerceAtLeast(selectionStart)
             return LineSelection(
                 startLine = startLineIndex + 1,
                 endLine = endLineIndex + 1,
                 startColumn = selectionStart - document.getLineStartOffset(startLineIndex) + 1,
-                endColumn = exclusiveEndOffset - document.getLineStartOffset(endLineIndex) + 1
+                endColumn = inclusiveEndOffset - document.getLineStartOffset(endLineIndex) + 1
             )
         } else {
             val line = document.getLineNumber(editor.caretModel.offset) + 1
@@ -141,7 +142,7 @@ object CommentDraftFactory {
         if (startLineIndex !in 0 until document.lineCount || endLineIndex !in 0 until document.lineCount) return null
         val startOffset = (document.getLineStartOffset(startLineIndex) + startColumn - 1)
             .coerceIn(document.getLineStartOffset(startLineIndex), document.getLineEndOffset(startLineIndex))
-        val endOffset = (document.getLineStartOffset(endLineIndex) + endColumn - 1)
+        val endOffset = (document.getLineStartOffset(endLineIndex) + endColumn)
             .coerceIn(document.getLineStartOffset(endLineIndex), document.getLineEndOffset(endLineIndex))
         if (endOffset <= startOffset) return null
         return TextRange(startOffset, endOffset)
@@ -162,7 +163,7 @@ object CommentDraftFactory {
         if (startColumn != null && endColumn != null) {
             val startOffset = (document.getLineStartOffset(startLine) + startColumn - 1)
                 .coerceIn(document.getLineStartOffset(startLine), document.getLineEndOffset(startLine))
-            val endOffset = (document.getLineStartOffset(endLine) + endColumn - 1)
+            val endOffset = (document.getLineStartOffset(endLine) + endColumn)
                 .coerceIn(document.getLineStartOffset(endLine), document.getLineEndOffset(endLine))
             if (endOffset > startOffset) return document.getText(TextRange(startOffset, endOffset))
         }
