@@ -23,6 +23,7 @@ import com.intellij.ide.util.DefaultPsiElementCellRenderer
 import com.intellij.openapi.actionSystem.ActionManager
 import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.actionSystem.CustomShortcutSet
+import com.intellij.openapi.actionSystem.DataProvider
 import com.intellij.openapi.actionSystem.IdeActions
 import com.intellij.openapi.actionSystem.KeyboardShortcut
 import com.intellij.openapi.Disposable
@@ -161,6 +162,7 @@ class MrReviewFileEditor(
     private var filterText = ""
     private var decoratedEditor: EditorEx? = null
     private var navigationEditors: List<EditorEx> = emptyList()
+    private val editorDataProviders = linkedMapOf<JComponent, DataProvider?>()
     private var fileListVisible = uiState.fileListVisible()
     private var expandedListProportion = uiState.fileListProportion().coerceIn(0.05f, 0.95f)
 
@@ -296,6 +298,7 @@ class MrReviewFileEditor(
         root.add(header, BorderLayout.NORTH)
         root.add(splitter, BorderLayout.CENTER)
         updateFileListVisibility()
+        installRequestPanelDataProvider()
 
         searchField.addDocumentListener(object : DocumentListener {
             override fun insertUpdate(e: DocumentEvent) = onSearchChanged()
@@ -365,6 +368,7 @@ class MrReviewFileEditor(
         decoratedEditor?.let(::clearMarkers)
         persistFileListState()
         uninstallNavigationSupport()
+        DataManager.removeDataProvider(requestPanel.component)
     }
 
     fun applySession(session: MrReviewSession, navigation: MrReviewService.ReviewNavigation?) {
@@ -498,6 +502,15 @@ class MrReviewFileEditor(
     private fun selectedTreeEntry(): TreeEntry? {
         val node = changesTree.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return null
         return node.userObject as? TreeEntry
+    }
+
+    private fun installRequestPanelDataProvider() {
+        DataManager.registerDataProvider(requestPanel.component, DataProvider { dataId ->
+            when {
+                DiffDataKeys.PREV_NEXT_DIFFERENCE_ITERABLE.`is`(dataId) -> crossFileDifferenceIterable()
+                else -> null
+            }
+        })
     }
 
     private fun showChange(index: Int, line: Int?, side: Side) {
@@ -683,6 +696,7 @@ class MrReviewFileEditor(
             navigateBackFromDiffAction.registerCustomShortcutSet(gotoBackShortcut, editor.contentComponent, this)
             nextDifferenceFromDiffAction.registerCustomShortcutSet(nextDifferenceShortcut, editor.contentComponent, this)
             previousDifferenceFromDiffAction.registerCustomShortcutSet(previousDifferenceShortcut, editor.contentComponent, this)
+            installEditorDiffDataProvider(editor)
             editor.addEditorMouseListener(navigateMouseListener, this)
         }
     }
@@ -696,8 +710,33 @@ class MrReviewFileEditor(
             nextDifferenceFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
             previousDifferenceFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
         }
+        restoreEditorDiffDataProviders()
         uninstallDiffNavigationKeyDispatcher()
         navigationEditors = emptyList()
+    }
+
+    private fun installEditorDiffDataProvider(editor: EditorEx) {
+        val component = editor.contentComponent
+        if (component in editorDataProviders) return
+        val originalProvider = DataManager.getDataProvider(component)
+        editorDataProviders[component] = originalProvider
+        DataManager.registerDataProvider(component, DataProvider { dataId ->
+            when {
+                DiffDataKeys.PREV_NEXT_DIFFERENCE_ITERABLE.`is`(dataId) -> crossFileDifferenceIterable()
+                else -> originalProvider?.getData(dataId)
+            }
+        })
+    }
+
+    private fun restoreEditorDiffDataProviders() {
+        editorDataProviders.forEach { (component, provider) ->
+            if (provider != null) {
+                DataManager.registerDataProvider(component, provider)
+            } else {
+                DataManager.removeDataProvider(component)
+            }
+        }
+        editorDataProviders.clear()
     }
 
     private fun diffSafeShortcutSet(actionId: String): CustomShortcutSet {
@@ -767,6 +806,23 @@ class MrReviewFileEditor(
         return navigateAdjacentChange(next)
     }
 
+    private fun crossFileDifferenceIterable(): PrevNextDifferenceIterable =
+        object : PrevNextDifferenceIterable {
+            override fun canGoNext(): Boolean =
+                currentDifferenceIterable()?.canGoNext() == true || canNavigateAdjacentChange(next = true)
+
+            override fun canGoPrev(): Boolean =
+                currentDifferenceIterable()?.canGoPrev() == true || canNavigateAdjacentChange(next = false)
+
+            override fun goNext() {
+                navigateDifferenceOrFile(next = true, currentDifferenceIterable())
+            }
+
+            override fun goPrev() {
+                navigateDifferenceOrFile(next = false, currentDifferenceIterable())
+            }
+        }
+
     private fun currentDifferenceIterable(): PrevNextDifferenceIterable? =
         currentViewer()?.let { viewer ->
             viewer.javaClass.methods
@@ -774,10 +830,16 @@ class MrReviewFileEditor(
                 ?.invoke(viewer) as? PrevNextDifferenceIterable
         }
 
-    private fun navigateAdjacentChange(next: Boolean): Boolean {
+    private fun canNavigateAdjacentChange(next: Boolean): Boolean {
         val activeSession = session ?: return false
         val targetIndex = if (next) selectedChangeIndex + 1 else selectedChangeIndex - 1
-        if (targetIndex !in activeSession.changes.indices) return false
+        return targetIndex in activeSession.changes.indices
+    }
+
+    private fun navigateAdjacentChange(next: Boolean): Boolean {
+        if (!canNavigateAdjacentChange(next)) return false
+        val activeSession = session ?: return false
+        val targetIndex = if (next) selectedChangeIndex + 1 else selectedChangeIndex - 1
         return service.navigateToChange(targetIndex)
     }
 

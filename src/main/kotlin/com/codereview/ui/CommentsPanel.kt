@@ -99,16 +99,25 @@ import javax.swing.event.DocumentListener
 import javax.swing.text.DefaultEditorKit
 
 class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
+    private var allThreads: List<ReviewThread> = emptyList()
     private var threads: List<ReviewThread> = emptyList()
+    private var filteredThreadsByFilter: Map<CommentFilter, List<ReviewThread>> = emptyMap()
+    private var filterCounts: Map<CommentFilter, Int> = emptyMap()
+    private var activeFilter: CommentFilter = CommentFilter.OPEN
     private var editingState: InlineEditState? = null
     private val threadViews = linkedMapOf<String, ThreadCardView>()
+    private val threadCardCache = linkedMapOf<String, CachedThreadCard>()
     private var transientDraftCard: ThreadCardView? = null
     private var flashingCommentId: String? = null
     private var flashOn = false
     private var flashTimer: Timer? = null
     private var syncAnimationTimer: Timer? = null
+    private var renderBatchTimer: Timer? = null
+    private var cacheWarmupTimer: Timer? = null
+    private var renderGeneration = 0
     private val commentViews = mutableMapOf<String, JComponent>()
     private val syncProgressIcon = SyncProgressIcon()
+    private val filterButtons = linkedMapOf<CommentFilter, JButton>()
 
     private val cardsContainer = JBPanel<JBPanel<*>>().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -225,8 +234,31 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
                 add(JBLabel("Comments").apply {
                     isOpaque = false
                 }, BorderLayout.CENTER)
+                add(buildFilterBar(), BorderLayout.SOUTH)
             }, BorderLayout.NORTH)
             add(cardsScrollPane, BorderLayout.CENTER)
+        }
+
+    private fun buildFilterBar(): JComponent =
+        JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(3))).apply {
+            isOpaque = false
+            border = JBUI.Borders.empty(6, 0, 0, 0)
+            CommentFilter.entries.forEach { filter ->
+                val button = JButton().apply {
+                    isFocusable = false
+                    margin = JBUI.insets(1, 4)
+                    cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                    addActionListener {
+                        if (activeFilter != filter) {
+                            activeFilter = filter
+                            renderFilteredCards()
+                        }
+                    }
+                }
+                filterButtons[filter] = button
+                add(button)
+            }
+            updateFilterButtons()
         }
 
     fun beginDraft(draft: CommentDraft) {
@@ -281,12 +313,17 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     fun refresh() {
         val service = CommentService.getInstance(project)
-        threads = service.allThreads().sortedWith(
+        allThreads = service.allThreads().sortedWith(
             compareByDescending<ReviewThread> { it.updatedAt }.thenBy { it.file }.thenBy { it.startLine }
         )
+        rebuildFilterCache()
+        applyThreadFilter()
+        updateFilterButtons()
 
         val selectedId = CommentSelectionService.getInstance(project).currentSelection()
         if (selectedId != null && service.find(selectedId) == null) {
+            CommentSelectionService.getInstance(project).select(null)
+        } else if (selectedId != null && threads.none { thread -> thread.comments.any { it.id == selectedId } }) {
             CommentSelectionService.getInstance(project).select(null)
         }
 
@@ -298,10 +335,74 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             editingState = null
         }
 
+        threadCardCache.clear()
         renderCards()
+        scheduleCardCacheWarmup()
     }
 
-    private fun renderCards() {
+    private fun renderFilteredCards() {
+        applyThreadFilter()
+        updateFilterButtons()
+        renderCards(
+            scrollToSelection = false,
+            reuseCachedCards = true,
+            incremental = false
+        )
+    }
+
+    private fun applyThreadFilter() {
+        threads = filteredThreadsByFilter[activeFilter].orEmpty()
+    }
+
+    private fun updateFilterButtons() {
+        filterButtons.forEach { (filter, button) ->
+            val selected = activeFilter == filter
+            val count = filterCounts[filter] ?: 0
+            button.text = "${filter.shortLabel} $count"
+            button.toolTipText = "${filter.label}: $count"
+            button.font = uiFont(10f, selected)
+            button.foreground = if (selected) selectedFilterForeground() else UIUtil.getLabelForeground()
+            button.background = if (selected) selectedFilterBackground() else unselectedFilterBackground()
+            button.isOpaque = selected || !isDarkTheme()
+            button.isContentAreaFilled = selected || !isDarkTheme()
+            button.border = BorderFactory.createCompoundBorder(
+                JBUI.Borders.customLine(if (selected) selectedFilterBorder() else cardBorder()),
+                JBUI.Borders.empty(1, 4)
+            )
+        }
+        emptyState.text = activeFilter.emptyText
+    }
+
+    private fun rebuildFilterCache() {
+        val currentUserName = normalizeUserName(GitUserProvider.currentDisplayName(project))
+        val filtered = CommentFilter.entries.associateWith { filter ->
+            allThreads.filter { matchesFilter(filter, it, currentUserName) }
+        }
+        filteredThreadsByFilter = filtered
+        filterCounts = filtered.mapValues { it.value.size }
+    }
+
+    private fun matchesFilter(filter: CommentFilter, thread: ReviewThread, currentUserName: String?): Boolean =
+        when (filter) {
+            CommentFilter.OPEN -> thread.status != "resolved"
+            CommentFilter.PARTICIPATING -> thread.comments.any { isCurrentUserComment(it, currentUserName) }
+            CommentFilter.LOCAL -> thread.syncStatus != "synced" || thread.comments.any { it.syncStatus != "synced" }
+            CommentFilter.ALL -> true
+        }
+
+    private fun isCurrentUserComment(comment: ReviewComment, currentUserName: String?): Boolean =
+        comment.remoteCommentId == null || normalizeUserName(comment.createdByName) == currentUserName
+
+    private fun normalizeUserName(value: String?): String? =
+        value?.trim()?.lowercase()?.takeIf { it.isNotBlank() }
+
+    private fun renderCards(
+        scrollToSelection: Boolean = true,
+        reuseCachedCards: Boolean = false,
+        incremental: Boolean = false
+    ) {
+        stopRenderBatch()
+        val generation = ++renderGeneration
         threadViews.clear()
         commentViews.clear()
         transientDraftCard = null
@@ -319,21 +420,124 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (threads.isEmpty() && activeEdit !is InlineEditState.NewThread) {
             cardsContainer.add(emptyState)
         } else {
-            threads.forEachIndexed { index, thread ->
-                val card = createThreadCard(thread)
-                threadViews[thread.id] = card
-                cardsContainer.add(card.root)
-                if (index != threads.lastIndex) {
-                    cardsContainer.add(Box.createVerticalStrut(JBUI.scale(8)))
-                }
+            val initialCount = if (incremental) INITIAL_FILTER_RENDER_COUNT.coerceAtMost(threads.size) else threads.size
+            appendThreadCards(0, initialCount, reuseCachedCards)
+            if (incremental && initialCount < threads.size) {
+                scheduleThreadRenderBatch(initialCount, reuseCachedCards, generation)
             }
         }
 
         cardsContainer.revalidate()
         cardsContainer.repaint()
-        scrollToComment(CommentSelectionService.getInstance(project).currentSelection())
+        if (scrollToSelection) scrollToComment(CommentSelectionService.getInstance(project).currentSelection())
         if (activeEdit is InlineEditState.NewThread) scrollToTransientDraft()
     }
+
+    private fun appendThreadCards(fromIndex: Int, toIndex: Int, reuseCachedCards: Boolean) {
+        for (index in fromIndex until toIndex) {
+            val thread = threads.getOrNull(index) ?: continue
+            val card = if (reuseCachedCards) cachedThreadCard(thread) else createThreadCard(thread)
+            threadViews[thread.id] = card
+            cardsContainer.add(card.root)
+            if (index != threads.lastIndex) {
+                cardsContainer.add(Box.createVerticalStrut(JBUI.scale(8)))
+            }
+        }
+    }
+
+    private fun scheduleThreadRenderBatch(startIndex: Int, reuseCachedCards: Boolean, generation: Int) {
+        var nextIndex = startIndex
+        renderBatchTimer = Timer(FILTER_RENDER_BATCH_DELAY_MS) {
+            if (generation != renderGeneration) {
+                stopRenderBatch()
+                return@Timer
+            }
+            val end = (nextIndex + FILTER_RENDER_BATCH_SIZE).coerceAtMost(threads.size)
+            appendThreadCards(nextIndex, end, reuseCachedCards)
+            nextIndex = end
+            cardsContainer.revalidate()
+            cardsContainer.repaint()
+            if (nextIndex >= threads.size) {
+                stopRenderBatch()
+            }
+        }.apply {
+            initialDelay = FILTER_RENDER_BATCH_DELAY_MS
+            start()
+        }
+    }
+
+    private fun stopRenderBatch() {
+        renderBatchTimer?.stop()
+        renderBatchTimer = null
+    }
+
+    private fun scheduleCardCacheWarmup() {
+        stopCacheWarmup()
+        if (allThreads.isEmpty()) return
+        val pending = ArrayDeque(allThreads.map { it.id })
+        val threadsById = allThreads.associateBy { it.id }
+        cacheWarmupTimer = Timer(CACHE_WARMUP_DELAY_MS) {
+            var created = 0
+            while (created < CACHE_WARMUP_BATCH_SIZE && pending.isNotEmpty()) {
+                val thread = threadsById[pending.removeFirst()] ?: continue
+                cachedThreadCard(thread)
+                created++
+            }
+            if (pending.isEmpty()) {
+                stopCacheWarmup()
+            }
+        }.apply {
+            initialDelay = CACHE_WARMUP_INITIAL_DELAY_MS
+            start()
+        }
+    }
+
+    private fun stopCacheWarmup() {
+        cacheWarmupTimer?.stop()
+        cacheWarmupTimer = null
+    }
+
+    private fun cachedThreadCard(thread: ReviewThread): ThreadCardView {
+        val rootComment = rootComment(thread)
+        val cacheKey = listOf(
+            thread.updatedAt,
+            thread.status,
+            thread.syncStatus,
+            thread.outdated.toString(),
+            rootComment?.id.orEmpty(),
+            rootComment?.updatedAt.orEmpty(),
+            editingState?.javaClass?.simpleName.orEmpty()
+        ).joinToString("|")
+        val cached = threadCardCache[thread.id]
+        if (cached != null && cached.key == cacheKey) {
+            registerCachedCommentViews(thread, cached.view)
+            return cached.view
+        }
+        val created = createThreadCard(thread)
+        threadCardCache[thread.id] = CachedThreadCard(cacheKey, created)
+        return created
+    }
+
+    private fun registerCachedCommentViews(thread: ReviewThread, view: ThreadCardView) {
+        thread.comments.forEach { comment ->
+            findComponentByName(view.root, commentViewName(comment.id))?.let {
+                commentViews[comment.id] = it
+            }
+        }
+    }
+
+    private fun findComponentByName(component: Component, name: String): JComponent? {
+        if (component is JComponent && component.name == name) return component
+        if (component is java.awt.Container) {
+            component.components.forEach { child ->
+                findComponentByName(child, name)?.let { return it }
+            }
+        }
+        return null
+    }
+
+    private fun commentViewName(commentId: String): String =
+        "code-review-comment-$commentId"
 
     private fun createDraftCard(editState: InlineEditState.NewThread): ThreadCardView {
         val titleLabel = headerTitle(fileNameOf(editState.draft.file), editState.draft.file)
@@ -440,6 +644,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         val canModify = canModify(comment)
 
         val block = JBPanel<JBPanel<*>>().apply {
+            name = commentViewName(comment.id)
             layout = BoxLayout(this, BoxLayout.Y_AXIS)
             isOpaque = false
             alignmentX = Component.LEFT_ALIGNMENT
@@ -1684,6 +1889,18 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             Color(0xD8DEE4)
         }
 
+    private fun selectedFilterForeground(): Color =
+        if (isDarkTheme()) Color(0xD6E8FF) else Color(0x0A4C8A)
+
+    private fun selectedFilterBackground(): Color =
+        if (isDarkTheme()) mix(cardSurface(), Color(0x2F81F7), 0.24f) else Color(0xE8F2FF)
+
+    private fun selectedFilterBorder(): Color =
+        if (isDarkTheme()) mix(cardSurface(), Color(0x58A6FF), 0.55f) else Color(0x74B5F5)
+
+    private fun unselectedFilterBackground(): Color =
+        if (isDarkTheme()) cardSurface() else Color.WHITE
+
     private fun luminance(color: Color): Double {
         fun channel(value: Int): Double {
             val normalized = value / 255.0
@@ -1695,9 +1912,22 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     companion object {
         const val TOOL_WINDOW_ID = "Code Review"
         private const val CLICK_OWNED_CLIENT_PROPERTY = "code.review.click.owned"
+        private const val INITIAL_FILTER_RENDER_COUNT = 8
+        private const val FILTER_RENDER_BATCH_SIZE = 8
+        private const val FILTER_RENDER_BATCH_DELAY_MS = 25
+        private const val CACHE_WARMUP_BATCH_SIZE = 4
+        private const val CACHE_WARMUP_INITIAL_DELAY_MS = 250
+        private const val CACHE_WARMUP_DELAY_MS = 40
         private val IMAGE_MARKDOWN = Regex("!\\[[^\\]]*]\\(([^)]+)\\)")
         private val HTML_IMAGE_SRC = Regex("<img\\b[^>]*\\bsrc\\s*=\\s*(?:(['\"])(.*?)\\1|([^\\s>]+))", RegexOption.IGNORE_CASE)
         private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
+    }
+
+    private enum class CommentFilter(val label: String, val shortLabel: String, val emptyText: String) {
+        OPEN("Open", "Open", "No open comments."),
+        PARTICIPATING("Participating", "Me", "No comments you are participating in."),
+        LOCAL("Local", "Local", "No local comments need syncing."),
+        ALL("All", "All", "No comments on this branch yet.")
     }
 
     private sealed interface InlineEditState {
@@ -1719,6 +1949,11 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         val root: JComponent,
         val stripe: JComponent,
         val threadId: String
+    )
+
+    private data class CachedThreadCard(
+        val key: String,
+        val view: ThreadCardView
     )
 
     private class SyncProgressIcon : Icon {
