@@ -12,12 +12,14 @@ import java.net.URI
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
+import java.security.MessageDigest
 import java.time.Instant
 import java.util.UUID
 import javax.imageio.ImageIO
 
 object CommentImageSupport {
     private val imageExtensions = setOf("png", "jpg", "jpeg", "gif", "bmp")
+    private val remoteCacheBasenameInvalid = Regex("[^A-Za-z0-9._-]+")
 
     fun isSupportedImage(file: File): Boolean =
         file.isFile && file.extension.lowercase() in imageExtensions
@@ -44,7 +46,9 @@ object CommentImageSupport {
 
     fun resolve(project: Project, rawPath: String): File? {
         val path = rawPath.trim().trim('"', '\'')
-        if (path.startsWith("http://") || path.startsWith("https://")) return null
+        if (path.startsWith("http://") || path.startsWith("https://")) {
+            return resolveRemoteCache(project, path)
+        }
         val fromUri = runCatching {
             if (path.startsWith("file:")) Path.of(URI(path)).toFile() else null
         }.getOrNull()
@@ -55,6 +59,40 @@ object CommentImageSupport {
         if (projectRelative.exists()) return projectRelative
 
         return Path.of(basePath, ".code-review").resolve(path).normalize().toFile().takeIf { it.exists() }
+    }
+
+    /**
+     * Resolve a remote upload URL to its deterministic local cache file.
+     *
+     * Cache layout matches `sync.py::_target_local_path_for`:
+     *   `.code-review/assets/<branch>/remote-<sha1(url)[:12]>-<sanitized-basename>`
+     *
+     * Returns the file if it has been downloaded by `sync-comments`; null otherwise.
+     * The renderer falls back to a `[image](url)` placeholder when null.
+     */
+    private fun resolveRemoteCache(project: Project, url: String): File? {
+        val basePath = project.basePath ?: return null
+        val branch = GitBranchProvider.safeBranchFileName(GitBranchProvider.currentBranch(project))
+        val digest = sha1Hex(url).substring(0, 12)
+        val basename = remoteUrlBasename(url)
+        val sanitized = remoteCacheBasenameInvalid.replace(basename, "_").ifBlank { "image" }
+        val target = Path.of(basePath, ".code-review", "assets", branch, "remote-$digest-$sanitized")
+            .normalize().toFile()
+        return target.takeIf { it.isFile }
+    }
+
+    private fun sha1Hex(input: String): String {
+        val md = MessageDigest.getInstance("SHA-1")
+        val bytes = md.digest(input.toByteArray(Charsets.UTF_8))
+        val sb = StringBuilder(bytes.size * 2)
+        for (b in bytes) sb.append("%02x".format(b))
+        return sb.toString()
+    }
+
+    private fun remoteUrlBasename(url: String): String {
+        val withoutQuery = url.substringBefore('?').substringBefore('#')
+        val tail = withoutQuery.substringAfterLast('/', missingDelimiterValue = withoutQuery)
+        return tail.ifBlank { "image" }
     }
 
     private fun nextAttachmentPath(project: Project, extension: String): Path {

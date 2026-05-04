@@ -39,6 +39,8 @@ class CommentEditorDecorations(private val project: Project) {
     private val rangeMarkerKey = Key.create<Boolean>("code.review.comment.range.marker")
     private val selectedRangeMarkerKey = Key.create<Boolean>("code.review.comment.selected.range.marker")
     private val icon: Icon = IconLoader.getIcon("/icons/comment.svg", CommentEditorDecorations::class.java)
+    @Volatile
+    private var refreshScheduled = false
 
     init {
         val connection = project.messageBus.connect()
@@ -65,7 +67,10 @@ class CommentEditorDecorations(private val project: Project) {
     }
 
     fun refreshOpenEditors() {
+        if (refreshScheduled) return
+        refreshScheduled = true
         ApplicationManager.getApplication().invokeLater {
+            refreshScheduled = false
             val editorManager = FileEditorManager.getInstance(project)
             editorManager.allEditors
                 .filterIsInstance<TextEditor>()

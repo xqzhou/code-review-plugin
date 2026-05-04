@@ -104,6 +104,8 @@ class MrReviewFileEditor(
     private val rangeMarkerKey = Key.create<Boolean>("code.review.mr.range.marker")
     private val selectedRangeMarkerKey = Key.create<Boolean>("code.review.mr.selected.range.marker")
     private val commentIcon = IconLoader.getIcon("/icons/comment.svg", MrReviewFileEditor::class.java)
+    @Volatile
+    private var diffDecorationRefreshScheduled = false
 
     private val titleLabel = JBLabel("MR Review").apply {
         font = UIUtil.getLabelFont().deriveFont(UIUtil.getLabelFont().size2D + 1f)
@@ -553,7 +555,10 @@ class MrReviewFileEditor(
     }
 
     private fun refreshDiffDecorations() {
+        if (diffDecorationRefreshScheduled) return
+        diffDecorationRefreshScheduled = true
         SwingUtilities.invokeLater {
+            diffDecorationRefreshScheduled = false
             decoratedEditor?.let(::clearMarkers)
             val editor = currentRightEditor() ?: run {
                 decoratedEditor = null

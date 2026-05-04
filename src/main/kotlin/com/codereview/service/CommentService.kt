@@ -23,8 +23,27 @@ class CommentService(private val project: Project) {
 
     fun storeFilePath(): String = store.currentBranchFile().toString()
 
-    fun allThreadsStored(): List<ReviewThread> =
-        read().threads.map(::copyThread).map(::enrichThread)
+    fun reloadFromDiskAndNotify() {
+        cachedThreadSource = null
+        cachedStoredThreads = null
+        store.invalidate()
+        ApplicationManager.getApplication().invokeLater {
+            project.messageBus.syncPublisher(TOPIC).onCommentsChanged()
+        }
+    }
+
+    private var cachedThreadSource: CommentFile? = null
+    private var cachedStoredThreads: List<ReviewThread>? = null
+
+    fun allThreadsStored(): List<ReviewThread> {
+        val data = read()
+        val cached = cachedStoredThreads.takeIf { cachedThreadSource === data }
+        val threads = cached ?: data.threads.map(::copyThread).map(::enrichThread).also {
+            cachedThreadSource = data
+            cachedStoredThreads = it
+        }
+        return threads.map(::copyThread)
+    }
 
     fun allThreads(): List<ReviewThread> =
         allThreadsStored()
@@ -262,6 +281,8 @@ class CommentService(private val project: Project) {
     private fun read(): CommentFile = store.load()
 
     private fun persist(data: CommentFile) {
+        cachedThreadSource = null
+        cachedStoredThreads = null
         store.save(data)
         ApplicationManager.getApplication().invokeLater {
             project.messageBus.syncPublisher(TOPIC).onCommentsChanged()

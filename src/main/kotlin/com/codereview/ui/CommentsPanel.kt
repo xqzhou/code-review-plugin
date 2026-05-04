@@ -7,6 +7,7 @@ import com.codereview.model.ReviewComment
 import com.codereview.model.ReviewThread
 import com.codereview.service.CommentSelectionService
 import com.codereview.service.CommentService
+import com.codereview.service.CommentSyncService
 import com.codereview.service.MrReviewService
 import com.codereview.util.ProjectFiles
 import com.intellij.icons.AllIcons
@@ -42,6 +43,7 @@ import java.awt.Component
 import java.awt.Cursor
 import java.awt.Dimension
 import java.awt.Font
+import java.awt.Graphics
 import java.awt.GridLayout
 import java.awt.Image
 import java.awt.KeyEventDispatcher
@@ -79,6 +81,7 @@ import javax.swing.BorderFactory
 import javax.swing.Box
 import javax.swing.BoxLayout
 import javax.swing.ImageIcon
+import javax.swing.Icon
 import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JMenuItem
@@ -103,7 +106,9 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     private var flashingCommentId: String? = null
     private var flashOn = false
     private var flashTimer: Timer? = null
+    private var syncAnimationTimer: Timer? = null
     private val commentViews = mutableMapOf<String, JComponent>()
+    private val syncProgressIcon = SyncProgressIcon()
 
     private val cardsContainer = JBPanel<JBPanel<*>>().apply {
         layout = BoxLayout(this, BoxLayout.Y_AXIS)
@@ -144,16 +149,37 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun buildToolbar(): ActionToolbar {
+        lateinit var toolbar: ActionToolbar
         val group = DefaultActionGroup().apply {
-            add(object : AnAction("Open MR Diff", "Open the MR diff review for the current branch", null) {
+            add(object : AnAction("Open MR Diff", "Open the MR diff review for the current branch", AllIcons.Actions.Diff) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
                 override fun actionPerformed(e: AnActionEvent) {
                     MrReviewService.getInstance(project).openReview()
                 }
             })
-            add(object : AnAction("Refresh", "Reload comments from disk", AllIcons.Actions.Refresh) {
+            add(object : AnAction("Sync from MR", "Pull MR comments through the local sync-comments agent", AllIcons.Actions.Refresh) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
-                override fun actionPerformed(e: AnActionEvent) = refresh()
+                override fun update(e: AnActionEvent) {
+                    val syncing = CommentSyncService.getInstance(project).isSyncing()
+                    e.presentation.text = if (syncing) "Syncing from MR" else "Sync from MR"
+                    e.presentation.description = if (syncing) {
+                        "MR comments are being synchronized"
+                    } else {
+                        "Pull MR comments through the local sync-comments agent"
+                    }
+                    e.presentation.icon = if (syncing) syncProgressIcon else AllIcons.Actions.Refresh
+                }
+
+                override fun actionPerformed(e: AnActionEvent) {
+                    CommentSyncService.getInstance(project).syncFromMr()
+                    animateSyncToolbar(toolbar)
+                }
+            })
+            add(object : AnAction("Open Sync Log", "Open the most recent MR comment sync log", AllIcons.Actions.Show) {
+                override fun getActionUpdateThread() = ActionUpdateThread.BGT
+                override fun actionPerformed(e: AnActionEvent) {
+                    CommentSyncService.getInstance(project).openLastSyncLog()
+                }
             })
             add(object : AnAction("Copy Path of JSON Store", "Copy the path of the comments JSON file", AllIcons.Actions.Copy) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
@@ -163,8 +189,27 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
                 }
             })
         }
-        return ActionManager.getInstance().createActionToolbar("CodeReview.Toolbar", group, true).also {
+        toolbar = ActionManager.getInstance().createActionToolbar("CodeReview.Toolbar", group, true).also {
             it.targetComponent = this
+        }
+        return toolbar
+    }
+
+    private fun animateSyncToolbar(toolbar: ActionToolbar) {
+        val existing = syncAnimationTimer
+        if (existing?.isRunning == true) return
+        syncAnimationTimer = Timer(150) {
+            toolbar.updateActionsImmediately()
+            toolbar.component.repaint()
+            if (!CommentSyncService.getInstance(project).isSyncing()) {
+                syncAnimationTimer?.stop()
+                syncAnimationTimer = null
+                toolbar.updateActionsImmediately()
+                toolbar.component.repaint()
+            }
+        }.apply {
+            initialDelay = 0
+            start()
         }
     }
 
@@ -1296,7 +1341,6 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         editingState = null
         val root = rootComment(created) ?: return true
         CommentSelectionService.getInstance(project).select(root.id)
-        refresh()
         startFlash(root.id)
         return true
     }
@@ -1307,7 +1351,6 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         val reply = CommentService.getInstance(project).addReply(editState.threadId, text) ?: return false
         editingState = null
         CommentSelectionService.getInstance(project).select(reply.id)
-        refresh()
         startFlash(reply.id)
         return true
     }
@@ -1323,7 +1366,6 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         CommentService.getInstance(project).update(editState.commentId, text)
         editingState = null
         CommentSelectionService.getInstance(project).select(editState.commentId)
-        refresh()
         return true
     }
 
@@ -1678,4 +1720,30 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         val stripe: JComponent,
         val threadId: String
     )
+
+    private class SyncProgressIcon : Icon {
+        private val frames = listOf(
+            AllIcons.Process.Step_1,
+            AllIcons.Process.Step_2,
+            AllIcons.Process.Step_3,
+            AllIcons.Process.Step_4,
+            AllIcons.Process.Step_5,
+            AllIcons.Process.Step_6,
+            AllIcons.Process.Step_7,
+            AllIcons.Process.Step_8
+        )
+
+        override fun paintIcon(c: Component?, g: Graphics, x: Int, y: Int) {
+            frames[currentFrame()].paintIcon(c, g, x, y)
+        }
+
+        override fun getIconWidth(): Int =
+            frames.maxOf { it.iconWidth }
+
+        override fun getIconHeight(): Int =
+            frames.maxOf { it.iconHeight }
+
+        private fun currentFrame(): Int =
+            ((System.currentTimeMillis() / 150) % frames.size).toInt()
+    }
 }

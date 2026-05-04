@@ -18,6 +18,9 @@ import java.util.UUID
 class CommentStore(private val project: Project) {
 
     private val gson = GsonBuilder().setPrettyPrinting().create()
+    private var cachedFile: Path? = null
+    private var cachedFingerprint: FileFingerprint? = null
+    private var cachedData: CommentFile? = null
 
     private fun rootDir(): Path {
         val base = project.basePath ?: System.getProperty("user.home")
@@ -36,13 +39,30 @@ class CommentStore(private val project: Project) {
         val file = currentBranchFile()
         val branch = GitBranchProvider.currentBranch(project)
         if (!Files.exists(file)) {
-            return CommentFile(branch = branch)
+            if (cachedFile == file && cachedFingerprint == null) {
+                cachedData?.let { return it }
+            }
+            cachedFile = file
+            cachedFingerprint = null
+            cachedData = CommentFile(branch = branch)
+            return cachedData!!
+        }
+        val fingerprint = fingerprint(file)
+        if (cachedFile == file && cachedFingerprint == fingerprint) {
+            cachedData?.let { return it }
         }
         return runCatching {
             Files.newBufferedReader(file).use {
                 gson.fromJson(it, CommentFile::class.java) ?: CommentFile(branch = branch)
-            }.normalize(branch)
+            }.normalize(branch).also { data ->
+                cachedFile = file
+                cachedFingerprint = fingerprint
+                cachedData = data
+            }
         }.getOrElse {
+            cachedFile = null
+            cachedFingerprint = null
+            cachedData = null
             backupCorruptStore(file)
             ApplicationManager.getApplication().invokeLater {
                 CommentNotifications.warn(
@@ -64,7 +84,20 @@ class CommentStore(private val project: Project) {
         val tmp = file.resolveSibling("${file.fileName}.tmp")
         Files.newBufferedWriter(tmp).use { gson.toJson(normalized, it) }
         Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING, StandardCopyOption.ATOMIC_MOVE)
+        cachedFile = file
+        cachedFingerprint = fingerprint(file)
+        cachedData = normalized
     }
+
+    @Synchronized
+    fun invalidate() {
+        cachedFile = null
+        cachedFingerprint = null
+        cachedData = null
+    }
+
+    private fun fingerprint(file: Path): FileFingerprint =
+        FileFingerprint(Files.getLastModifiedTime(file).toMillis(), Files.size(file))
 
     private fun CommentFile.normalize(branch: String): CommentFile {
         this.branch = branch
@@ -154,4 +187,6 @@ class CommentStore(private val project: Project) {
             Files.move(file, backup, StandardCopyOption.REPLACE_EXISTING)
         }
     }
+
+    private data class FileFingerprint(val modifiedMillis: Long, val size: Long)
 }
