@@ -23,6 +23,7 @@ import com.intellij.openapi.editor.colors.EditorFontType
 import com.intellij.openapi.components.service
 import com.intellij.openapi.fileEditor.FileDocumentManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
+import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.ide.CopyPasteManager
 import com.intellij.openapi.project.Project
 import com.intellij.openapi.ui.Messages
@@ -68,6 +69,7 @@ import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.InputStream
 import java.io.Reader
+import java.io.StringReader
 import java.net.URI
 import java.net.URL
 import java.nio.ByteBuffer
@@ -90,6 +92,7 @@ import javax.swing.JPanel
 import javax.swing.JPopupMenu
 import javax.swing.ScrollPaneConstants
 import javax.swing.JTextArea
+import javax.swing.JTextPane
 import javax.swing.KeyStroke
 import javax.swing.SwingUtilities
 import javax.swing.Timer
@@ -97,6 +100,11 @@ import javax.swing.TransferHandler
 import javax.swing.event.DocumentEvent
 import javax.swing.event.DocumentListener
 import javax.swing.text.DefaultEditorKit
+import javax.swing.text.MutableAttributeSet
+import javax.swing.text.SimpleAttributeSet
+import javax.swing.text.StyleConstants
+import javax.swing.text.html.HTML
+import javax.swing.text.html.parser.ParserDelegator
 
 class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     private var allThreads: List<ReviewThread> = emptyList()
@@ -818,6 +826,8 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
 
     private fun commentContent(content: String): JComponent {
+        if (looksLikeHtmlComment(content)) return htmlCommentContent(content)
+
         val matches = IMAGE_MARKDOWN.findAll(content).toList()
         if (matches.isEmpty()) return commentText(content)
 
@@ -844,6 +854,229 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             }
         }
     }
+
+    private fun htmlCommentContent(content: String): JComponent {
+        val text = commentRichText(htmlCommentTextPieces(content))
+        val imageSources = htmlImageSources(content)
+        if (imageSources.isEmpty()) return text
+
+        return JBPanel<JBPanel<*>>().apply {
+            layout = BoxLayout(this, BoxLayout.Y_AXIS)
+            isOpaque = false
+            alignmentX = Component.LEFT_ALIGNMENT
+            add(text)
+            imageSources.forEach { src ->
+                add(Box.createVerticalStrut(JBUI.scale(6)))
+                add(commentImage(src))
+            }
+        }
+    }
+
+    private fun commentRichText(pieces: List<CommentTextPiece>): JComponent {
+        if (pieces.isEmpty()) return commentText("")
+
+        return WrappingTextPane().apply {
+            isEditable = false
+            isOpaque = false
+            border = null
+            font = bodyFont()
+            foreground = UIUtil.getLabelForeground()
+            alignmentX = Component.LEFT_ALIGNMENT
+
+            val normal = SimpleAttributeSet().apply {
+                StyleConstants.setFontFamily(this, bodyFont().family)
+                StyleConstants.setFontSize(this, bodyFont().size)
+                StyleConstants.setForeground(this, UIUtil.getLabelForeground())
+            }
+            val linkColor = if (isDarkTheme()) Color(0x6CAEFF) else Color(0x1F6FEB)
+            pieces.forEach { piece ->
+                val attributes = if (piece.href == null) {
+                    normal
+                } else {
+                    SimpleAttributeSet(normal).apply {
+                        StyleConstants.setForeground(this, linkColor)
+                        StyleConstants.setUnderline(this, true)
+                        addAttribute(HREF_ATTRIBUTE, piece.href)
+                    }
+                }
+                styledDocument.insertString(styledDocument.length, piece.text, attributes)
+            }
+
+            val mouseHandler = object : MouseAdapter() {
+                override fun mouseClicked(e: MouseEvent) {
+                    if (!SwingUtilities.isLeftMouseButton(e)) return
+                    hrefAt(this@apply, e.point)?.let(BrowserUtil::browse)
+                }
+
+                override fun mouseMoved(e: MouseEvent) {
+                    cursor = if (hrefAt(this@apply, e.point) == null) {
+                        Cursor.getDefaultCursor()
+                    } else {
+                        Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
+                    }
+                }
+            }
+            addMouseListener(mouseHandler)
+            addMouseMotionListener(mouseHandler)
+        }
+    }
+
+    private fun hrefAt(textPane: JTextPane, point: Point): String? {
+        val position = textPane.viewToModel2D(point)
+        if (position < 0 || position >= textPane.document.length) return null
+        return textPane.styledDocument.getCharacterElement(position)
+            .attributes
+            .getAttribute(HREF_ATTRIBUTE) as? String
+    }
+
+    private fun looksLikeHtmlComment(content: String): Boolean =
+        HTML_COMMENT_TAG.containsMatchIn(content)
+
+    private fun htmlCommentTextPieces(content: String): List<CommentTextPiece> =
+        runCatching {
+            val pieces = mutableListOf<CommentTextPiece>()
+            val hrefStack = mutableListOf<String?>()
+            val protectedLinks = protectHtmlLinks(UNSAFE_HTML_BLOCK.replace(content, ""))
+
+            fun activeHref(): String? = hrefStack.lastOrNull()
+
+            fun append(text: String, href: String? = activeHref()) {
+                val normalized = normalizeHtmlText(text)
+                if (normalized.isEmpty()) return
+                val last = pieces.lastOrNull()
+                if (last != null && last.href == href) {
+                    pieces[pieces.lastIndex] = last.copy(text = last.text + normalized)
+                } else {
+                    pieces.add(CommentTextPiece(normalized, href))
+                }
+            }
+
+            fun appendHtmlText(text: String) {
+                var offset = 0
+                LINK_TOKEN.findAll(text).forEach { match ->
+                    append(text.substring(offset, match.range.first))
+                    val tokenHref = protectedLinks.hrefByToken[match.value]
+                    if (tokenHref == null) {
+                        protectedLinks.endTokenToStart[match.value]?.let { startToken ->
+                            for (index in hrefStack.indices.reversed()) {
+                                if (hrefStack[index] == protectedLinks.hrefByToken[startToken]) {
+                                    hrefStack.removeAt(index)
+                                    break
+                                }
+                            }
+                        }
+                    } else {
+                        hrefStack.add(tokenHref)
+                    }
+                    offset = match.range.last + 1
+                }
+                append(text.substring(offset))
+            }
+
+            fun newline() {
+                if (pieces.isEmpty()) return
+                if (pieces.last().text.endsWith("\n")) return
+                pieces.add(CommentTextPiece("\n", null))
+            }
+
+            ParserDelegator().parse(
+                StringReader(protectedLinks.html),
+                object : javax.swing.text.html.HTMLEditorKit.ParserCallback() {
+                    override fun handleStartTag(tag: HTML.Tag, attributes: MutableAttributeSet, pos: Int) {
+                        when (tag) {
+                            HTML.Tag.DIV, HTML.Tag.P, HTML.Tag.LI, HTML.Tag.TR -> newline()
+                            HTML.Tag.A -> hrefStack.add(attributes.getAttribute(HTML.Attribute.HREF)?.toString())
+                        }
+                    }
+
+                    override fun handleSimpleTag(tag: HTML.Tag, attributes: MutableAttributeSet, pos: Int) {
+                        if (tag == HTML.Tag.BR) newline()
+                    }
+
+                    override fun handleText(data: CharArray, pos: Int) {
+                        appendHtmlText(String(data))
+                    }
+
+                    override fun handleEndTag(tag: HTML.Tag, pos: Int) {
+                        when (tag) {
+                            HTML.Tag.A -> if (hrefStack.isNotEmpty()) hrefStack.removeAt(hrefStack.lastIndex)
+                            HTML.Tag.DIV, HTML.Tag.P, HTML.Tag.LI, HTML.Tag.TR -> newline()
+                        }
+                    }
+                },
+                true
+            )
+
+            trimCommentTextPieces(pieces)
+        }.getOrElse {
+            listOf(CommentTextPiece(fallbackHtmlText(content), null)).filter { piece -> piece.text.isNotBlank() }
+        }
+
+    private fun protectHtmlLinks(content: String): ProtectedHtmlLinks {
+        val hrefByToken = linkedMapOf<String, String>()
+        val endTokenToStart = linkedMapOf<String, String>()
+        var index = 0
+        val html = HTML_LINK_TAG.replace(content) { match ->
+            val href = HTML_HREF_ATTRIBUTE.find(match.groupValues[1])?.let { hrefMatch ->
+                decodeHtmlAttribute(hrefMatch.groupValues[2].ifBlank { hrefMatch.groupValues[3] })
+            } ?: return@replace match.value
+            val startToken = "\uE000CR_LINK_START_${index}\uE001"
+            val endToken = "\uE000CR_LINK_END_${index}\uE001"
+            index += 1
+            hrefByToken[startToken] = href
+            endTokenToStart[endToken] = startToken
+            "$startToken${match.groupValues[2]}$endToken"
+        }
+        return ProtectedHtmlLinks(html, hrefByToken, endTokenToStart)
+    }
+
+    private fun decodeHtmlAttribute(value: String): String =
+        value
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+
+    private fun normalizeHtmlText(text: String): String =
+        text
+            .replace('\u00A0', ' ')
+            .replace(Regex("\\s+"), " ")
+            .replace(Regex("\\*\\*([^*]+)\\*\\*"), "$1")
+            .replace("`", "")
+
+    private fun trimCommentTextPieces(pieces: List<CommentTextPiece>): List<CommentTextPiece> {
+        val mutable = pieces.toMutableList()
+        while (mutable.isNotEmpty() && mutable.first().text.isBlank()) mutable.removeAt(0)
+        while (mutable.isNotEmpty() && mutable.last().text.isBlank()) mutable.removeAt(mutable.lastIndex)
+        if (mutable.isEmpty()) return emptyList()
+
+        mutable[0] = mutable.first().copy(text = mutable.first().text.trimStart())
+        mutable[mutable.lastIndex] = mutable.last().copy(text = mutable.last().text.trimEnd())
+        return mutable.filter { it.text.isNotEmpty() }
+    }
+
+    private fun fallbackHtmlText(content: String): String =
+        HTML_ANY_TAG.replace(
+            HTML_BLOCK_TAG.replace(
+                HTML_BR_TAG.replace(UNSAFE_HTML_BLOCK.replace(content, ""), "\n"),
+                "\n"
+            ),
+            ""
+        )
+            .replace("&nbsp;", " ")
+            .replace("&amp;", "&")
+            .replace("&lt;", "<")
+            .replace("&gt;", ">")
+            .replace("&quot;", "\"")
+            .replace("&#39;", "'")
+            .replace(Regex("\\n{3,}"), "\n\n")
+            .trim()
+
+    private fun htmlImageSources(content: String): List<String> =
+        HTML_IMAGE_SRC.findAll(content).mapNotNull { match ->
+            match.groupValues[2].ifBlank { match.groupValues[3] }.takeIf { it.isNotBlank() }
+        }.toList()
 
     private fun commentText(text: String): JComponent =
         JBTextArea(text).apply {
@@ -1841,7 +2074,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun installClickTarget(component: Component, listener: MouseAdapter, skipOwnedSubtrees: Boolean) {
-        if (component is JButton || component is ActionLink || component is JTextArea) {
+        if (component is JButton || component is ActionLink || component is JTextArea || component is JTextPane) {
             return
         }
         if (skipOwnedSubtrees && component is JComponent && component.getClientProperty(CLICK_OWNED_CLIENT_PROPERTY) == true) {
@@ -1930,8 +2163,17 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         private const val CACHE_WARMUP_BATCH_SIZE = 4
         private const val CACHE_WARMUP_INITIAL_DELAY_MS = 250
         private const val CACHE_WARMUP_DELAY_MS = 40
+        private const val HREF_ATTRIBUTE = "code.review.href"
         private val IMAGE_MARKDOWN = Regex("!\\[[^\\]]*]\\(([^)]+)\\)")
         private val HTML_IMAGE_SRC = Regex("<img\\b[^>]*\\bsrc\\s*=\\s*(?:(['\"])(.*?)\\1|([^\\s>]+))", RegexOption.IGNORE_CASE)
+        private val HTML_COMMENT_TAG = Regex("</?(a|div|span|br|p|ul|ol|li|strong|b|em|i|code|pre|img)\\b", RegexOption.IGNORE_CASE)
+        private val UNSAFE_HTML_BLOCK = Regex("<(script|style)\\b[^>]*>.*?</\\1>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        private val HTML_BR_TAG = Regex("<br\\s*/?>", RegexOption.IGNORE_CASE)
+        private val HTML_BLOCK_TAG = Regex("</?(div|p|li|tr)\\b[^>]*>", RegexOption.IGNORE_CASE)
+        private val HTML_ANY_TAG = Regex("<[^>]+>")
+        private val HTML_LINK_TAG = Regex("<a\\b([^>]*)>(.*?)</a>", setOf(RegexOption.IGNORE_CASE, RegexOption.DOT_MATCHES_ALL))
+        private val HTML_HREF_ATTRIBUTE = Regex("\\bhref\\s*=\\s*(?:(['\"])(.*?)\\1|([^\\s>]+))", RegexOption.IGNORE_CASE)
+        private val LINK_TOKEN = Regex("\uE000CR_LINK_(?:START|END)_\\d+\uE001")
         private val TIME_FORMAT: DateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm")
     }
 
@@ -1957,6 +2199,14 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         ) : InlineEditState
     }
 
+    private data class CommentTextPiece(val text: String, val href: String?)
+
+    private data class ProtectedHtmlLinks(
+        val html: String,
+        val hrefByToken: Map<String, String>,
+        val endTokenToStart: Map<String, String>
+    )
+
     private data class ThreadCardView(
         val root: JComponent,
         val stripe: JComponent,
@@ -1967,6 +2217,17 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         val key: String,
         val view: ThreadCardView
     )
+
+    private class WrappingTextPane : JTextPane() {
+        override fun getScrollableTracksViewportWidth(): Boolean = true
+
+        override fun getPreferredSize(): Dimension {
+            parent?.width?.takeIf { it > 0 }?.let { width ->
+                setSize(width, Short.MAX_VALUE.toInt())
+            }
+            return super.getPreferredSize()
+        }
+    }
 
     private class SyncProgressIcon : Icon {
         private val frames = listOf(
