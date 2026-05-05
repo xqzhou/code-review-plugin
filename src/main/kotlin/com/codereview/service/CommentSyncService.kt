@@ -72,6 +72,38 @@ class CommentSyncService(private val project: Project) {
             return
         }
 
+        // Fast path: pure-shell driver covers --pull (no MCP). ~30x faster than the agent.
+        // Falls through to the agent on exit 65 (unsupported state, e.g. MCP-only ops).
+        val shellResult = runCatching {
+            runShellDriver(projectDir, indicator)
+        }.getOrNull()
+        if (shellResult != null && shellResult.exitCode == 0 && !shellResult.canceled && !shellResult.timedOut) {
+            CommentService.getInstance(project).reloadFromDiskAndNotify()
+            val summary = summarizeOutput(shellResult.output).ifBlank {
+                "Pulled MR comments via shell driver."
+            }
+            notifyInfo("MR Comments Synced", "$summary\nLog: ${shellResult.logFile}")
+            return
+        }
+        if (shellResult != null && shellResult.canceled) {
+            notifyWarn("MR Comment Sync Canceled", "Shell driver was canceled.\nLog: ${shellResult.logFile}")
+            return
+        }
+        if (shellResult != null && shellResult.timedOut) {
+            notifyWarn(
+                "MR Comment Sync Timed Out",
+                "Shell driver did not finish within ${SYNC_TIMEOUT_MINUTES} minutes.\nLog: ${shellResult.logFile}"
+            )
+            return
+        }
+        if (shellResult != null && shellResult.exitCode != 0) {
+            notifyWarn(
+                "MR Comment Sync Failed",
+                "Shell driver exited with code ${shellResult.exitCode}.\n${summarizeOutput(shellResult.output)}\nLog: ${shellResult.logFile}"
+            )
+            return
+        }
+
         val agent = resolveAgent(projectDir) ?: run {
             reloadLocalOnly("Local Agent Missing", "Cannot find `claude` or `codex`; reloaded local comments only.")
             return
@@ -110,9 +142,31 @@ class CommentSyncService(private val project: Project) {
         notifyInfo("MR Comments Synced", "$summary\nLog: ${result.logFile}")
     }
 
-    private fun runAgent(agent: AgentCommand, projectDir: Path, indicator: ProgressIndicator): AgentResult {
+    private fun runShellDriver(projectDir: Path, indicator: ProgressIndicator): AgentResult? {
+        val script = projectDir.resolve(".agents/skills/sync-comments/sync.sh")
+        if (!Files.isRegularFile(script)) return null
+        val command = listOf("/usr/bin/env", "bash", script.toString(), "--mode", "pull")
+        val agent = AgentCommand(displayName = "ShellPull", command = command, prompt = "")
+        indicator.text = "Running sync-comments shell driver"
+        val result = runProcess(agent, projectDir, indicator)
+        if (result.exitCode == 65) return null  // unsupported state — caller falls back to agent
+        return result
+    }
+
+    private fun runAgent(agent: AgentCommand, projectDir: Path, indicator: ProgressIndicator): AgentResult =
+        runProcess(agent, projectDir, indicator)
+
+    private fun runProcess(agent: AgentCommand, projectDir: Path, indicator: ProgressIndicator): AgentResult {
         val logFile = nextSyncLogFile(projectDir)
         Files.createDirectories(logFile.parent)
+        val t0 = System.nanoTime()
+        fun stamp(label: String, writer: BufferedWriter) {
+            val ms = (System.nanoTime() - t0) / 1_000_000
+            synchronized(writer) {
+                writer.appendLine("[T+%6dms] %s".format(ms, label))
+                writer.flush()
+            }
+        }
         val process = ProcessBuilder(agent.command)
             .directory(projectDir.toFile())
             .redirectErrorStream(true)
@@ -121,6 +175,7 @@ class CommentSyncService(private val project: Project) {
         val output = StringBuffer()
         val logWriter = Files.newBufferedWriter(logFile)
         logWriter.writeSyncHeader(agent, projectDir)
+        stamp("subprocess spawned (pid=${process.pid()})", logWriter)
         runCatching {
             process.outputStream.bufferedWriter().use { writer ->
                 writer.write(agent.prompt)
@@ -138,15 +193,15 @@ class CommentSyncService(private val project: Project) {
             isDaemon = true,
             name = "code-review-comment-sync-output"
         ) {
-            logWriter.use { writer ->
-                process.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { line ->
-                        writer.appendLine(line)
-                        synchronized(output) {
-                            output.append(line).append('\n')
-                            if (output.length > MAX_OUTPUT_CHARS) {
-                                output.delete(0, output.length - MAX_OUTPUT_CHARS)
-                            }
+            var firstLine = true
+            process.inputStream.bufferedReader().useLines { lines ->
+                lines.forEach { line ->
+                    if (firstLine) { stamp("first stdout line", logWriter); firstLine = false }
+                    synchronized(logWriter) { logWriter.appendLine(line); logWriter.flush() }
+                    synchronized(output) {
+                        output.append(line).append('\n')
+                        if (output.length > MAX_OUTPUT_CHARS) {
+                            output.delete(0, output.length - MAX_OUTPUT_CHARS)
                         }
                     }
                 }
@@ -158,17 +213,24 @@ class CommentSyncService(private val project: Project) {
             if (indicator.isCanceled) {
                 process.destroyForcibly()
                 readerThread.join(1_000)
+                stamp("subprocess canceled", logWriter)
+                logWriter.close()
                 return AgentResult(-1, output.toString(), logFile, canceled = true, timedOut = false)
             }
             if (System.currentTimeMillis() > deadlineMillis) {
                 process.destroyForcibly()
                 readerThread.join(1_000)
+                stamp("subprocess timed out", logWriter)
+                logWriter.close()
                 return AgentResult(-1, output.toString(), logFile, canceled = false, timedOut = true)
             }
             Thread.sleep(200)
         }
         readerThread.join(1_000)
-        return AgentResult(process.exitValue(), output.toString(), logFile, canceled = false, timedOut = false)
+        val exitCode = process.exitValue()
+        stamp("subprocess exited code=$exitCode", logWriter)
+        logWriter.close()
+        return AgentResult(exitCode, output.toString(), logFile, canceled = false, timedOut = false)
     }
 
     private fun resolveAgent(projectDir: Path): AgentCommand? {
