@@ -314,7 +314,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     fun refresh() {
         val service = CommentService.getInstance(project)
         allThreads = service.allThreads().sortedWith(
-            compareByDescending<ReviewThread> { it.updatedAt }.thenBy { it.file }.thenBy { it.startLine }
+            compareByDescending<ReviewThread> { threadActivityTime(it) }.thenBy { it.file }.thenBy { it.startLine }
         )
         rebuildFilterCache()
         applyThreadFilter()
@@ -1780,6 +1780,18 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
                 .atZone(ZoneId.systemDefault())
                 .format(TIME_FORMAT)
         }.getOrElse { timestamp }
+
+    private fun threadActivityTime(thread: ReviewThread): Instant =
+        thread.comments
+            .asSequence()
+            .filter { it.deletedAt == null }
+            .mapNotNull { parseInstantOrNull(it.updatedAt.ifBlank { it.createdAt }) }
+            .maxOrNull()
+            ?: parseInstantOrNull(thread.updatedAt.ifBlank { thread.createdAt })
+            ?: Instant.EPOCH
+
+    private fun parseInstantOrNull(timestamp: String): Instant? =
+        timestamp.takeIf { it.isNotBlank() }?.let { runCatching { Instant.parse(it) }.getOrNull() }
 
     private fun uiFont(size: Float, bold: Boolean = false): Font {
         val base = JBUI.Fonts.label()
