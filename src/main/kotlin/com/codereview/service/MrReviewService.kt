@@ -76,6 +76,32 @@ class MrReviewService(private val project: Project) {
         }
     }
 
+    fun openReview(targetFile: VirtualFile?, line: Int?) {
+        val session = prepareSession() ?: return
+        if (session.changes.isEmpty()) {
+            CommentNotifications.info(
+                project,
+                "No Diff To Review",
+                "No changed files between `${session.targetRef}` and `${session.sourceBranch}`."
+            )
+            return
+        }
+        diffBackStack.clear()
+        val targetNavigation = if (targetFile != null && line != null) {
+            navigationForFile(session, targetFile, line)
+        } else {
+            null
+        }
+        showSession(targetNavigation?.first ?: session, targetNavigation?.second)
+        if (session.skippedBinaryFiles > 0) {
+            CommentNotifications.info(
+                project,
+                "Binary Files Skipped",
+                "Skipped ${session.skippedBinaryFiles} binary file(s) while building the MR diff view."
+            )
+        }
+    }
+
     fun currentSession(): MrReviewSession? = currentSession
 
     fun currentNavigation(): ReviewNavigation? = currentNavigation
@@ -95,21 +121,28 @@ class MrReviewService(private val project: Project) {
 
     fun navigateToFileDiff(targetFile: VirtualFile, line: Int, from: ReviewNavigation? = null): Boolean {
         val session = currentSession ?: return false
-        val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return false
+        val target = navigationForFile(session, targetFile, line) ?: return false
+        from?.let(::pushDiffBackNavigation)
+        showSession(target.first, target.second)
+        return true
+    }
+
+    private fun navigationForFile(
+        session: MrReviewSession,
+        targetFile: VirtualFile,
+        line: Int
+    ): Pair<MrReviewSession, ReviewNavigation>? {
+        val relativePath = ProjectFiles.relativePath(project, targetFile) ?: return null
         val existingIndex = findChangeIndex(session, relativePath, relativePath, relativePath)
         if (existingIndex >= 0) {
             val change = session.changes[existingIndex]
-            from?.let(::pushDiffBackNavigation)
-            showSession(session, ReviewNavigation(existingIndex, line, preferredSide(change)))
-            return true
+            return Pair(session, ReviewNavigation(existingIndex, line, preferredSide(change)))
         }
 
-        val runtimeChange = buildRuntimeChange(session, targetFile) ?: return false
+        val runtimeChange = buildRuntimeChange(session, targetFile) ?: return null
         val updatedSession = session.copy(changes = session.changes + runtimeChange)
         val nextIndex = updatedSession.changes.lastIndex
-        from?.let(::pushDiffBackNavigation)
-        showSession(updatedSession, ReviewNavigation(nextIndex, line, preferredSide(runtimeChange)))
-        return true
+        return Pair(updatedSession, ReviewNavigation(nextIndex, line, preferredSide(runtimeChange)))
     }
 
     fun canNavigateBackInDiff(): Boolean = diffBackStack.isNotEmpty()

@@ -16,12 +16,14 @@ import com.intellij.openapi.actionSystem.ActionToolbar
 import com.intellij.openapi.actionSystem.AnAction
 import com.intellij.openapi.actionSystem.AnActionEvent
 import com.intellij.openapi.actionSystem.ActionUpdateThread
+import com.intellij.openapi.actionSystem.CommonDataKeys
 import com.intellij.openapi.actionSystem.DefaultActionGroup
 import com.intellij.openapi.editor.colors.EditorColors
 import com.intellij.openapi.editor.colors.EditorColorsManager
 import com.intellij.openapi.editor.colors.EditorFontType
 import com.intellij.openapi.components.service
 import com.intellij.openapi.fileEditor.FileDocumentManager
+import com.intellij.openapi.fileEditor.FileEditorManager
 import com.intellij.openapi.fileEditor.OpenFileDescriptor
 import com.intellij.ide.BrowserUtil
 import com.intellij.openapi.ide.CopyPasteManager
@@ -171,7 +173,12 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             add(object : AnAction("Open MR Diff", "Open the MR diff review for the current branch", AllIcons.Actions.Diff) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
                 override fun actionPerformed(e: AnActionEvent) {
-                    MrReviewService.getInstance(project).openReview()
+                    val fileEditorManager = FileEditorManager.getInstance(project)
+                    val editor = e.getData(CommonDataKeys.EDITOR) ?: fileEditorManager.selectedTextEditor
+                    val targetFile = e.getData(CommonDataKeys.VIRTUAL_FILE)
+                        ?: fileEditorManager.selectedFiles.firstOrNull()
+                    val line = editor?.caretModel?.logicalPosition?.line
+                    MrReviewService.getInstance(project).openReview(targetFile, line)
                 }
             })
             add(object : AnAction("Sync from MR", "Pull MR comments through the local sync-comments agent", AllIcons.Actions.Refresh) {
