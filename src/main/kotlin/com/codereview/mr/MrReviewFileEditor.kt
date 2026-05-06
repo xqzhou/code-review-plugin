@@ -127,10 +127,10 @@ class MrReviewFileEditor(
         showsRootHandles = true
         selectionModel.selectionMode = javax.swing.tree.TreeSelectionModel.SINGLE_TREE_SELECTION
         cellRenderer = ChangeTreeRenderer()
-        rowHeight = 0
+        rowHeight = JBUI.scale(22)
         setLineStyleAngled()
         emptyText.text = "No changed files"
-        border = JBUI.Borders.empty(4, 0)
+        border = JBUI.Borders.empty(2, 0)
     }
     private val placeholder = JPanel(BorderLayout()).apply {
         add(
@@ -261,9 +261,9 @@ class MrReviewFileEditor(
         listPanel = JPanel(BorderLayout()).apply {
             border = BorderFactory.createCompoundBorder(
                 JBUI.Borders.customLineRight(JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()),
-                JBUI.Borders.empty(8)
+                JBUI.Borders.empty(6, 6)
             )
-            add(searchField.apply { border = JBUI.Borders.emptyBottom(8) }, BorderLayout.NORTH)
+            add(searchField.apply { border = JBUI.Borders.emptyBottom(6) }, BorderLayout.NORTH)
             add(JBScrollPane(changesTree).apply { border = BorderFactory.createEmptyBorder() }, BorderLayout.CENTER)
         }
         splitter = OnePixelSplitter(false, expandedListProportion, 0.0f, 1.0f).apply {
@@ -1142,7 +1142,7 @@ class MrReviewFileEditor(
             row: Int,
             hasFocus: Boolean
         ) {
-            border = JBUI.Borders.empty(2, 4)
+            border = JBUI.Borders.empty(0, 3)
             val node = (value as? DefaultMutableTreeNode)?.userObject as? TreeEntry ?: return
             when (node) {
                 TreeEntry.Root -> Unit
