@@ -75,6 +75,7 @@ import java.awt.FlowLayout
 import java.awt.KeyboardFocusManager
 import java.awt.KeyEventDispatcher
 import java.awt.event.KeyEvent
+import java.awt.event.MouseAdapter
 import java.beans.PropertyChangeListener
 import java.beans.PropertyChangeSupport
 import javax.swing.BorderFactory
@@ -311,6 +312,14 @@ class MrReviewFileEditor(
             val entry = selectedTreeEntry() as? TreeEntry.File ?: return@addTreeSelectionListener
             showChange(entry.index, null, Side.RIGHT)
         }
+        changesTree.addMouseListener(object : MouseAdapter() {
+            override fun mouseClicked(event: MouseEvent) {
+                if (!SwingUtilities.isLeftMouseButton(event)) return
+                val entry = treeEntryAt(event.x, event.y) as? TreeEntry.File ?: return
+                if (entry.index == selectedChangeIndex) return
+                showChange(entry.index, null, Side.RIGHT)
+            }
+        })
 
         val connection = project.messageBus.connect(this)
         connection.subscribe(MrReviewService.TOPIC, object : MrReviewService.Listener {
@@ -501,6 +510,12 @@ class MrReviewFileEditor(
 
     private fun selectedTreeEntry(): TreeEntry? {
         val node = changesTree.lastSelectedPathComponent as? DefaultMutableTreeNode ?: return null
+        return node.userObject as? TreeEntry
+    }
+
+    private fun treeEntryAt(x: Int, y: Int): TreeEntry? {
+        val path = changesTree.getPathForLocation(x, y) ?: return null
+        val node = path.lastPathComponent as? DefaultMutableTreeNode ?: return null
         return node.userObject as? TreeEntry
     }
 
