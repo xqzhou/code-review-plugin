@@ -17,26 +17,40 @@ import java.nio.file.Path
 import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 
 @Service(Service.Level.PROJECT)
 class CommentSyncService(private val project: Project) {
 
     private val running = AtomicBoolean(false)
+    private val activeMode = AtomicReference<SyncMode?>(null)
 
     fun isSyncing(): Boolean = running.get()
 
+    fun activeSyncText(): String? = activeMode.get()?.activeText
+
     fun syncFromMr() {
+        runSync(SyncMode.PULL)
+    }
+
+    fun pushToMr() {
+        runSync(SyncMode.PUSH)
+    }
+
+    private fun runSync(mode: SyncMode) {
         if (!running.compareAndSet(false, true)) {
             notifyInfo("MR Comment Sync Running", "A sync is already in progress.")
             return
         }
+        activeMode.set(mode)
 
-        ProgressManager.getInstance().run(object : Task.Backgroundable(project, "Syncing MR Comments", true) {
+        ProgressManager.getInstance().run(object : Task.Backgroundable(project, mode.taskTitle, true) {
             override fun run(indicator: ProgressIndicator) {
                 try {
-                    syncFromMrInBackground(indicator)
+                    syncInBackground(indicator, mode)
                 } finally {
+                    activeMode.set(null)
                     running.set(false)
                 }
             }
@@ -58,7 +72,7 @@ class CommentSyncService(private val project: Project) {
         }
     }
 
-    private fun syncFromMrInBackground(indicator: ProgressIndicator) {
+    private fun syncInBackground(indicator: ProgressIndicator, mode: SyncMode) {
         val projectDir = project.basePath?.let(Path::of) ?: run {
             reloadLocalOnly("Project Path Missing", "Cannot sync MR comments because this project has no local path.")
             return
@@ -72,64 +86,64 @@ class CommentSyncService(private val project: Project) {
             return
         }
 
-        // Fast path: pure-shell driver covers --pull (no MCP). ~30x faster than the agent.
+        // Fast path: pure-shell driver covers common sync modes without launching the agent.
         // Falls through to the agent on exit 65 (unsupported state, e.g. MCP-only ops).
         val shellResult = runCatching {
-            runShellDriver(projectDir, indicator)
+            runShellDriver(projectDir, indicator, mode)
         }.getOrNull()
         if (shellResult != null && shellResult.exitCode == 0 && !shellResult.canceled && !shellResult.timedOut) {
             CommentService.getInstance(project).reloadFromDiskAndNotify()
             val summary = summarizeOutput(shellResult.output).ifBlank {
-                "Pulled MR comments via shell driver."
+                mode.shellFallbackSummary
             }
-            notifyInfo("MR Comments Synced", "$summary\nLog: ${shellResult.logFile}")
+            notifyInfo(mode.successTitle, "$summary\nLog: ${shellResult.logFile}")
             return
         }
         if (shellResult != null && shellResult.canceled) {
-            notifyWarn("MR Comment Sync Canceled", "Shell driver was canceled.\nLog: ${shellResult.logFile}")
+            notifyWarn("${mode.operationTitle} Canceled", "Shell driver was canceled.\nLog: ${shellResult.logFile}")
             return
         }
         if (shellResult != null && shellResult.timedOut) {
             notifyWarn(
-                "MR Comment Sync Timed Out",
+                "${mode.operationTitle} Timed Out",
                 "Shell driver did not finish within ${SYNC_TIMEOUT_MINUTES} minutes.\nLog: ${shellResult.logFile}"
             )
             return
         }
         if (shellResult != null && shellResult.exitCode != 0) {
             notifyWarn(
-                "MR Comment Sync Failed",
+                "${mode.operationTitle} Failed",
                 "Shell driver exited with code ${shellResult.exitCode}.\n${summarizeOutput(shellResult.output)}\nLog: ${shellResult.logFile}"
             )
             return
         }
 
-        val agent = resolveAgent(projectDir) ?: run {
+        val agent = resolveAgent(projectDir, mode) ?: run {
             reloadLocalOnly("Local Agent Missing", "Cannot find `claude` or `codex`; reloaded local comments only.")
             return
         }
 
-        indicator.text = "Running ${agent.displayName} sync-comments"
+        indicator.text = "Running ${agent.displayName} sync-comments ${mode.shellMode}"
         val result = runCatching {
             runAgent(agent, projectDir, indicator)
         }.getOrElse { error ->
-            notifyWarn("MR Comment Sync Failed", "Could not start ${agent.displayName}: ${error.message ?: error.javaClass.simpleName}")
+            notifyWarn("${mode.operationTitle} Failed", "Could not start ${agent.displayName}: ${error.message ?: error.javaClass.simpleName}")
             return
         }
         if (result.canceled) {
-            notifyWarn("MR Comment Sync Canceled", "The local agent process was canceled.\nLog: ${result.logFile}")
+            notifyWarn("${mode.operationTitle} Canceled", "The local agent process was canceled.\nLog: ${result.logFile}")
             return
         }
         if (result.timedOut) {
             notifyWarn(
-                "MR Comment Sync Timed Out",
+                "${mode.operationTitle} Timed Out",
                 "The local agent did not finish within ${SYNC_TIMEOUT_MINUTES} minutes.\nLog: ${result.logFile}"
             )
             return
         }
         if (result.exitCode != 0) {
             notifyWarn(
-                "MR Comment Sync Failed",
+                "${mode.operationTitle} Failed",
                 "${agent.displayName} exited with code ${result.exitCode}.\n${summarizeOutput(result.output)}\nLog: ${result.logFile}"
             )
             return
@@ -137,17 +151,17 @@ class CommentSyncService(private val project: Project) {
 
         CommentService.getInstance(project).reloadFromDiskAndNotify()
         val summary = summarizeOutput(result.output).ifBlank {
-            "Pulled MR comments into the local comment store."
+            mode.agentFallbackSummary
         }
-        notifyInfo("MR Comments Synced", "$summary\nLog: ${result.logFile}")
+        notifyInfo(mode.successTitle, "$summary\nLog: ${result.logFile}")
     }
 
-    private fun runShellDriver(projectDir: Path, indicator: ProgressIndicator): AgentResult? {
+    private fun runShellDriver(projectDir: Path, indicator: ProgressIndicator, mode: SyncMode): AgentResult? {
         val script = projectDir.resolve(".agents/skills/sync-comments/sync.sh")
         if (!Files.isRegularFile(script)) return null
-        val command = listOf("/usr/bin/env", "bash", script.toString(), "--mode", "pull")
-        val agent = AgentCommand(displayName = "ShellPull", command = command, prompt = "")
-        indicator.text = "Running sync-comments shell driver"
+        val command = listOf("/usr/bin/env", "bash", script.toString(), "--mode", mode.shellMode)
+        val agent = AgentCommand(displayName = mode.shellAgentName, command = command, prompt = "")
+        indicator.text = "Running sync-comments shell driver (${mode.shellMode})"
         val result = runProcess(agent, projectDir, indicator)
         if (result.exitCode == 65) return null  // unsupported state — caller falls back to agent
         return result
@@ -233,8 +247,8 @@ class CommentSyncService(private val project: Project) {
         return AgentResult(exitCode, output.toString(), logFile, canceled = false, timedOut = false)
     }
 
-    private fun resolveAgent(projectDir: Path): AgentCommand? {
-        val prompt = syncPrompt(projectDir)
+    private fun resolveAgent(projectDir: Path, mode: SyncMode): AgentCommand? {
+        val prompt = syncPrompt(projectDir, mode)
         if (isExecutableAvailable("claude")) {
             return AgentCommand(
                 displayName = "Claude",
@@ -275,11 +289,11 @@ class CommentSyncService(private val project: Project) {
         return null
     }
 
-    private fun syncPrompt(projectDir: Path): String {
+    private fun syncPrompt(projectDir: Path, mode: SyncMode): String {
         val branch = GitBranchProvider.currentBranch(project)
         val storePath = CommentService.getInstance(project).storeFilePath()
         return """
-            Use the repository-local sync-comments skill to pull MR comments into the code-review plugin JSON.
+            Use the repository-local sync-comments skill to ${mode.promptAction}.
 
             Working directory: $projectDir
             Skill file: ${projectDir.resolve(".agents/skills/sync-comments/SKILL.md")}
@@ -287,9 +301,9 @@ class CommentSyncService(private val project: Project) {
             Local comment store: $storePath
 
             Requirements:
-            - Run the sync-comments workflow in pull mode with confirmation, equivalent to: sync-comments --pull --confirm
+            - Run the sync-comments workflow in ${mode.shellMode} mode with confirmation, equivalent to: ${mode.promptCommand}
             - If the skill needs the MR URL, discover the MR for the current branch using the tools described by the skill.
-            - Only update the local .code-review comment JSON required by this sync.
+            - Only update the MR comments and local .code-review comment JSON required by this operation.
             - Do not edit source files.
             - Print a concise result summary.
         """.trimIndent()
@@ -390,6 +404,44 @@ class CommentSyncService(private val project: Project) {
         val canceled: Boolean,
         val timedOut: Boolean
     )
+
+    private enum class SyncMode(
+        val shellMode: String,
+        val taskTitle: String,
+        val operationTitle: String,
+        val successTitle: String,
+        val activeText: String,
+        val shellAgentName: String,
+        val promptAction: String,
+        val promptCommand: String,
+        val shellFallbackSummary: String,
+        val agentFallbackSummary: String
+    ) {
+        PULL(
+            shellMode = "pull",
+            taskTitle = "Syncing MR Comments",
+            operationTitle = "MR Comment Sync",
+            successTitle = "MR Comments Synced",
+            activeText = "Syncing from MR",
+            shellAgentName = "ShellPull",
+            promptAction = "pull MR comments into the code-review plugin JSON",
+            promptCommand = "sync-comments --pull --confirm",
+            shellFallbackSummary = "Pulled MR comments via shell driver.",
+            agentFallbackSummary = "Pulled MR comments into the local comment store."
+        ),
+        PUSH(
+            shellMode = "push",
+            taskTitle = "Pushing MR Comments",
+            operationTitle = "MR Comment Push",
+            successTitle = "MR Comments Pushed",
+            activeText = "Pushing to MR",
+            shellAgentName = "ShellPush",
+            promptAction = "push local code-review comments to the MR",
+            promptCommand = "sync-comments --push --confirm",
+            shellFallbackSummary = "Pushed local comments via shell driver.",
+            agentFallbackSummary = "Pushed local comments to the MR."
+        )
+    }
 
     private fun AgentCommand.commandForLog(): String =
         command.joinToString(" ") { part ->

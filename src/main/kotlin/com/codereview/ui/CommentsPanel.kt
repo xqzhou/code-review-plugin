@@ -184,8 +184,9 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             add(object : AnAction("Sync from MR", "Pull MR comments through the local sync-comments agent", AllIcons.Actions.Refresh) {
                 override fun getActionUpdateThread() = ActionUpdateThread.BGT
                 override fun update(e: AnActionEvent) {
-                    val syncing = CommentSyncService.getInstance(project).isSyncing()
-                    e.presentation.text = if (syncing) "Syncing from MR" else "Sync from MR"
+                    val syncService = CommentSyncService.getInstance(project)
+                    val syncing = syncService.isSyncing()
+                    e.presentation.text = syncService.activeSyncText() ?: "Sync from MR"
                     e.presentation.description = if (syncing) {
                         "MR comments are being synchronized"
                     } else {
@@ -196,6 +197,23 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
                 override fun actionPerformed(e: AnActionEvent) {
                     CommentSyncService.getInstance(project).syncFromMr()
+                    animateSyncToolbar(toolbar)
+                }
+            })
+            add(object : AnAction("Push to MR", "Push local comments to the MR through sync-comments", AllIcons.Actions.Upload) {
+                override fun getActionUpdateThread() = ActionUpdateThread.BGT
+                override fun update(e: AnActionEvent) {
+                    val syncing = CommentSyncService.getInstance(project).isSyncing()
+                    e.presentation.isEnabled = !syncing
+                    e.presentation.description = if (syncing) {
+                        "Wait for the current MR comment sync operation to finish"
+                    } else {
+                        "Push local comments to the MR through sync-comments"
+                    }
+                }
+
+                override fun actionPerformed(e: AnActionEvent) {
+                    CommentSyncService.getInstance(project).pushToMr()
                     animateSyncToolbar(toolbar)
                 }
             })
@@ -255,13 +273,13 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         }
 
     private fun buildFilterBar(): JComponent =
-        JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(3))).apply {
+        JBPanel<JBPanel<*>>(HorizontalLayout(JBUI.scale(2))).apply {
             isOpaque = false
             border = JBUI.Borders.empty(6, 0, 0, 0)
             CommentFilter.entries.forEach { filter ->
                 val button = JButton().apply {
                     isFocusable = false
-                    margin = JBUI.insets(1, 4)
+                    margin = JBUI.insets(1, 2)
                     cursor = Cursor.getPredefinedCursor(Cursor.HAND_CURSOR)
                     addActionListener {
                         if (activeFilter != filter) {
@@ -339,7 +357,13 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (selectedId != null && service.find(selectedId) == null) {
             CommentSelectionService.getInstance(project).select(null)
         } else if (selectedId != null && threads.none { thread -> thread.comments.any { it.id == selectedId } }) {
-            CommentSelectionService.getInstance(project).select(null)
+            if (filterContainsComment(CommentFilter.ALL, selectedId)) {
+                activeFilter = CommentFilter.ALL
+                applyThreadFilter()
+                updateFilterButtons()
+            } else {
+                CommentSelectionService.getInstance(project).select(null)
+            }
         }
 
         val active = editingState
@@ -382,7 +406,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             button.isContentAreaFilled = selected || !isDarkTheme()
             button.border = BorderFactory.createCompoundBorder(
                 JBUI.Borders.customLine(if (selected) selectedFilterBorder() else cardBorder()),
-                JBUI.Borders.empty(1, 4)
+                JBUI.Borders.empty(1, 2)
             )
         }
         emptyState.text = activeFilter.emptyText
@@ -403,6 +427,11 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             CommentFilter.PARTICIPATING -> thread.comments.any { isCurrentUserComment(it, currentUserName) }
             CommentFilter.LOCAL -> thread.syncStatus != "synced" || thread.comments.any { it.syncStatus != "synced" }
             CommentFilter.ALL -> true
+        }
+
+    private fun filterContainsComment(filter: CommentFilter, commentId: String): Boolean =
+        filteredThreadsByFilter[filter].orEmpty().any { thread ->
+            thread.comments.any { it.id == commentId }
         }
 
     private fun isCurrentUserComment(comment: ReviewComment, currentUserName: String?): Boolean =
@@ -1648,6 +1677,9 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
         if (isDarkTheme()) Color(0xD89B2B) else Color(0xF0B429)
 
     private fun syncCardSelection(commentId: String?) {
+        if (commentId != null) {
+            ensureCommentInVisibleFilter(commentId)
+        }
         threadViews.forEach { (threadId, view) ->
             val thread = threads.firstOrNull { it.id == threadId }
             val isSelected = thread?.comments?.any { it.id == commentId } == true
@@ -1663,6 +1695,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
 
     private fun scrollToComment(commentId: String?, alignmentFraction: Double?) {
         if (commentId == null) return
+        if (!ensureCommentInVisibleFilter(commentId)) return
         val threadId = CommentService.getInstance(project).findThreadByCommentId(commentId)?.id ?: return
         val target = commentViews[commentId] ?: threadViews[threadId]?.root ?: return
         SwingUtilities.invokeLater {
@@ -1672,6 +1705,14 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
                 scrollComponentToAlignment(target, alignmentFraction)
             }
         }
+    }
+
+    private fun ensureCommentInVisibleFilter(commentId: String): Boolean {
+        if (filterContainsComment(activeFilter, commentId)) return true
+        if (!filterContainsComment(CommentFilter.ALL, commentId)) return false
+        activeFilter = CommentFilter.ALL
+        renderFilteredCards()
+        return true
     }
 
     private fun convertToCardsContainer(component: Component): Rectangle =
