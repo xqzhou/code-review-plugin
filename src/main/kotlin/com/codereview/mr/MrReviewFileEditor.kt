@@ -18,6 +18,7 @@ import com.intellij.diff.tools.util.DiffDataKeys
 import com.intellij.diff.tools.util.PrevNextDifferenceIterable
 import com.intellij.diff.tools.util.side.TwosideTextDiffViewer
 import com.intellij.diff.util.Side
+import com.intellij.find.findUsages.FindUsagesManager
 import com.intellij.ide.DataManager
 import com.intellij.ide.util.DefaultPsiElementCellRenderer
 import com.intellij.openapi.actionSystem.ActionManager
@@ -56,6 +57,7 @@ import com.intellij.psi.PsiDocumentManager
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiManager
 import com.intellij.psi.PsiPolyVariantReference
+import com.intellij.psi.search.GlobalSearchScope
 import com.intellij.psi.search.searches.DefinitionsScopedSearch
 import com.intellij.ui.ColoredTreeCellRenderer
 import com.intellij.ui.OnePixelSplitter
@@ -170,6 +172,7 @@ class MrReviewFileEditor(
     private val gotoDeclarationShortcut = diffSafeShortcutSet(IdeActions.ACTION_GOTO_DECLARATION)
     private val gotoImplementationShortcut = diffSafeShortcutSet(IdeActions.ACTION_GOTO_IMPLEMENTATION)
     private val gotoTypeDeclarationShortcut = diffSafeShortcutSet(IdeActions.ACTION_GOTO_TYPE_DECLARATION)
+    private val findUsagesShortcut = diffSafeShortcutSet(IdeActions.ACTION_FIND_USAGES)
     private val gotoBackShortcut = CustomShortcutSet(
         *KeymapUtil.getActiveKeymapShortcuts(IdeActions.ACTION_GOTO_BACK).shortcuts
     )
@@ -212,6 +215,12 @@ class MrReviewFileEditor(
     private val navigateToTypeDeclarationAction = object : DumbAwareAction() {
         override fun actionPerformed(e: AnActionEvent) {
             navigateToTypeDeclarationFromDiffCaret(editorFromEvent(e))
+        }
+    }
+
+    private val findUsagesFromDiffAction = object : DumbAwareAction() {
+        override fun actionPerformed(e: AnActionEvent) {
+            findUsagesFromDiffCaret(editorFromEvent(e))
         }
     }
 
@@ -708,6 +717,7 @@ class MrReviewFileEditor(
             navigateFromDiffAction.registerCustomShortcutSet(gotoDeclarationShortcut, editor.contentComponent, this)
             navigateToImplementationAction.registerCustomShortcutSet(gotoImplementationShortcut, editor.contentComponent, this)
             navigateToTypeDeclarationAction.registerCustomShortcutSet(gotoTypeDeclarationShortcut, editor.contentComponent, this)
+            findUsagesFromDiffAction.registerCustomShortcutSet(findUsagesShortcut, editor.contentComponent, this)
             navigateBackFromDiffAction.registerCustomShortcutSet(gotoBackShortcut, editor.contentComponent, this)
             nextDifferenceFromDiffAction.registerCustomShortcutSet(nextDifferenceShortcut, editor.contentComponent, this)
             previousDifferenceFromDiffAction.registerCustomShortcutSet(previousDifferenceShortcut, editor.contentComponent, this)
@@ -721,6 +731,7 @@ class MrReviewFileEditor(
             navigateFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
             navigateToImplementationAction.unregisterCustomShortcutSet(editor.contentComponent)
             navigateToTypeDeclarationAction.unregisterCustomShortcutSet(editor.contentComponent)
+            findUsagesFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
             navigateBackFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
             nextDifferenceFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
             previousDifferenceFromDiffAction.unregisterCustomShortcutSet(editor.contentComponent)
@@ -882,6 +893,14 @@ class MrReviewFileEditor(
         return navigateToTypeDeclarationFromDiffOffset(actualEditor, line, column)
     }
 
+    private fun findUsagesFromDiffCaret(editor: EditorEx?): Boolean {
+        val actualEditor = editor ?: currentRightEditor() ?: return false
+        val offset = actualEditor.caretModel.offset.coerceAtLeast(0)
+        val line = actualEditor.document.getLineNumber(offset)
+        val column = offset - actualEditor.document.getLineStartOffset(line)
+        return findUsagesFromDiffOffset(actualEditor, line, column)
+    }
+
     private fun editorFromEvent(e: AnActionEvent): EditorEx? =
         (CommonDataKeys.EDITOR.getData(e.dataContext) as? EditorEx)
 
@@ -918,6 +937,24 @@ class MrReviewFileEditor(
             .firstOrNull()
             ?: return false
         return navigateToPsiTarget(target, line + 1, navigationContext.side)
+    }
+
+    private fun findUsagesFromDiffOffset(editor: EditorEx?, line: Int, column: Int): Boolean {
+        val navigationContext = navigationContext(editor, line, column) ?: return false
+        val target = resolveNavigationTarget(navigationContext.psiFile, navigationContext.offset)
+            ?: resolveSourceElement(navigationContext.psiFile, navigationContext.offset)
+            ?: return false
+        val element = TargetElementUtil.getNamedElement(target) ?: target
+        val manager = FindUsagesManager(project)
+        if (!manager.canFindUsages(element)) return false
+        manager.findUsages(
+            element,
+            element.containingFile,
+            null,
+            false,
+            GlobalSearchScope.projectScope(project)
+        )
+        return true
     }
 
     private fun navigationContext(editor: EditorEx?, line: Int, column: Int): NavigationContext? {
