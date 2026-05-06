@@ -374,7 +374,7 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
             editingState = null
         }
 
-        threadCardCache.clear()
+        evictStaleThreadCards()
         renderCards()
         scheduleCardCacheWarmup()
     }
@@ -542,25 +542,47 @@ class CommentsPanel(private val project: Project) : JPanel(BorderLayout()) {
     }
 
     private fun cachedThreadCard(thread: ReviewThread): ThreadCardView {
-        val rootComment = rootComment(thread)
         val cacheKey = listOf(
             thread.updatedAt,
             thread.status,
             thread.syncStatus,
             thread.outdated.toString(),
-            rootComment?.id.orEmpty(),
-            rootComment?.updatedAt.orEmpty(),
-            editingState?.javaClass?.simpleName.orEmpty()
+            thread.comments.joinToString(";") { comment ->
+                listOf(
+                    comment.id,
+                    comment.updatedAt,
+                    comment.syncStatus,
+                    comment.deletedAt.orEmpty(),
+                    comment.content.hashCode().toString()
+                ).joinToString(":")
+            },
+            editSignatureForThread(thread.id)
         ).joinToString("|")
         val cached = threadCardCache[thread.id]
         if (cached != null && cached.key == cacheKey) {
             registerCachedCommentViews(thread, cached.view)
+            val selectedCommentId = CommentSelectionService.getInstance(project).currentSelection()
+            val isSelected = thread.comments.any { it.id == selectedCommentId }
+            val isFlashing = flashOn && thread.comments.any { it.id == flashingCommentId }
+            applyCardStyle(cached.view, isSelected, isFlashing)
             return cached.view
         }
         val created = createThreadCard(thread)
         threadCardCache[thread.id] = CachedThreadCard(cacheKey, created)
         return created
     }
+
+    private fun evictStaleThreadCards() {
+        val activeThreadIds = allThreads.asSequence().map { it.id }.toSet()
+        threadCardCache.keys.retainAll(activeThreadIds)
+    }
+
+    private fun editSignatureForThread(threadId: String): String =
+        when (val active = editingState) {
+            is InlineEditState.EditComment -> if (active.threadId == threadId) "edit:${active.commentId}" else ""
+            is InlineEditState.Reply -> if (active.threadId == threadId) "reply" else ""
+            is InlineEditState.NewThread, null -> ""
+        }
 
     private fun registerCachedCommentViews(thread: ReviewThread, view: ThreadCardView) {
         thread.comments.forEach { comment ->

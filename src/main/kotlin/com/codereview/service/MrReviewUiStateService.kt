@@ -18,15 +18,22 @@ class MrReviewUiStateService : SimplePersistentStateComponent<MrReviewUiStateSer
     class UiState : BaseState() {
         var fileListVisible by property(true)
         var fileListProportion by property(0.24f)
+        var fileScope by string("all")
     }
 
     fun fileListVisible(): Boolean = state.fileListVisible
 
     fun fileListProportion(): Float = state.fileListProportion
 
+    fun fileScope(): String = state.fileScope ?: "all"
+
     fun setFileListState(visible: Boolean, proportion: Float) {
         state.fileListVisible = visible
         state.fileListProportion = proportion
+    }
+
+    fun setFileScope(scope: String) {
+        state.fileScope = scope
     }
 
     companion object {

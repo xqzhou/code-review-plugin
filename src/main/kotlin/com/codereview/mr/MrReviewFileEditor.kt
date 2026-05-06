@@ -81,6 +81,7 @@ import java.awt.event.MouseAdapter
 import java.beans.PropertyChangeListener
 import java.beans.PropertyChangeSupport
 import javax.swing.BorderFactory
+import javax.swing.JButton
 import javax.swing.JComponent
 import javax.swing.JPanel
 import javax.swing.SwingConstants
@@ -163,9 +164,11 @@ class MrReviewFileEditor(
     private var applyingSelection = false
     private var selectedChangeIndex = -1
     private var filterText = ""
+    private var fileScope = FileScope.fromId(uiState.fileScope())
     private var decoratedEditor: EditorEx? = null
     private var navigationEditors: List<EditorEx> = emptyList()
     private val editorDataProviders = linkedMapOf<JComponent, DataProvider?>()
+    private val scopeButtons = linkedMapOf<FileScope, JButton>()
     private var fileListVisible = uiState.fileListVisible()
     private var expandedListProportion = uiState.fileListProportion().coerceIn(0.05f, 0.95f)
 
@@ -273,7 +276,7 @@ class MrReviewFileEditor(
                 JBUI.Borders.customLineRight(JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()),
                 JBUI.Borders.empty(6, 6)
             )
-            add(searchField.apply { border = JBUI.Borders.emptyBottom(6) }, BorderLayout.NORTH)
+            add(buildFileListHeader(), BorderLayout.NORTH)
             add(JBScrollPane(changesTree).apply { border = BorderFactory.createEmptyBorder() }, BorderLayout.CENTER)
         }
         splitter = OnePixelSplitter(false, expandedListProportion, 0.0f, 1.0f).apply {
@@ -354,6 +357,36 @@ class MrReviewFileEditor(
         updateSession(service.currentSession(), service.currentNavigation())
     }
 
+    private fun buildFileListHeader(): JComponent =
+        JPanel(BorderLayout()).apply {
+            isOpaque = false
+            add(searchField.apply { border = JBUI.Borders.emptyBottom(5) }, BorderLayout.NORTH)
+            add(buildScopeBar(), BorderLayout.SOUTH)
+        }
+
+    private fun buildScopeBar(): JComponent =
+        JPanel(FlowLayout(FlowLayout.LEFT, JBUI.scale(2), 0)).apply {
+            isOpaque = false
+            border = JBUI.Borders.emptyBottom(5)
+            FileScope.entries.forEach { scope ->
+                val button = JButton(scope.label).apply {
+                    isFocusable = false
+                    margin = JBUI.insets(0, 3)
+                    font = UIUtil.getLabelFont().deriveFont(UIUtil.getLabelFont().size2D - 1f)
+                    addActionListener {
+                        if (fileScope != scope) {
+                            fileScope = scope
+                            uiState.setFileScope(scope.id)
+                            onVisibleChangeFilterChanged()
+                        }
+                    }
+                }
+                scopeButtons[scope] = button
+                add(button)
+            }
+            updateScopeButtons()
+        }
+
     override fun getComponent(): JComponent = root
 
     override fun getPreferredFocusedComponent(): JComponent = changesTree
@@ -398,7 +431,7 @@ class MrReviewFileEditor(
         renderHeader(session)
         rebuildTree(session)
 
-        val targetIndex = navigation?.changeIndex
+        val targetIndex = navigation?.changeIndex?.takeIf { treeHasChangeIndex(it) }
             ?: selectedChangeIndex.takeIf { treeHasChangeIndex(it) }
             ?: firstVisibleChangeIndex()
             ?: -1
@@ -425,12 +458,18 @@ class MrReviewFileEditor(
 
     private fun onSearchChanged() {
         filterText = searchField.text.trim()
+        onVisibleChangeFilterChanged()
+    }
+
+    private fun onVisibleChangeFilterChanged() {
         rebuildTree(session)
+        updateScopeButtons()
         val targetIndex = selectedChangeIndex.takeIf { treeHasChangeIndex(it) } ?: firstVisibleChangeIndex()
         if (targetIndex != null) {
-            selectTreeNode(targetIndex)
-        } else if (!changesTree.isSelectionEmpty) {
+            selectChange(targetIndex, null, Side.RIGHT)
+        } else {
             changesTree.clearSelection()
+            clearDiffPanel()
         }
     }
 
@@ -440,7 +479,7 @@ class MrReviewFileEditor(
         val query = filterText.lowercase()
         session?.changes
             ?.mapIndexed { index, change -> index to change }
-            ?.filter { (_, change) -> matchesFilter(change, query) }
+            ?.filter { (_, change) -> matchesVisibleChange(change, query) }
             ?.sortedBy { (_, change) -> change.displayPath() }
             ?.forEach { (index, change) ->
                 val path = change.displayPath()
@@ -461,6 +500,20 @@ class MrReviewFileEditor(
 
         treeModel.setRoot(rootNode)
         expandAll()
+    }
+
+    private fun updateScopeButtons() {
+        scopeButtons.forEach { (scope, button) ->
+            val selected = scope == fileScope
+            button.isOpaque = selected || !isDarkTheme()
+            button.isContentAreaFilled = selected || !isDarkTheme()
+            button.background = if (selected) scopeSelectedBackground() else UIUtil.getPanelBackground()
+            button.foreground = if (selected) scopeSelectedForeground() else UIUtil.getLabelForeground()
+            button.border = BorderFactory.createCompoundBorder(
+                JBUI.Borders.customLine(if (selected) scopeSelectedBorder() else JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()),
+                JBUI.Borders.empty(1, 3)
+            )
+        }
     }
 
     private fun expandAll() {
@@ -857,16 +910,34 @@ class MrReviewFileEditor(
         }
 
     private fun canNavigateAdjacentChange(next: Boolean): Boolean {
-        val activeSession = session ?: return false
-        val targetIndex = if (next) selectedChangeIndex + 1 else selectedChangeIndex - 1
-        return targetIndex in activeSession.changes.indices
+        return adjacentVisibleChangeIndex(next) != null
     }
 
     private fun navigateAdjacentChange(next: Boolean): Boolean {
-        if (!canNavigateAdjacentChange(next)) return false
-        val activeSession = session ?: return false
-        val targetIndex = if (next) selectedChangeIndex + 1 else selectedChangeIndex - 1
+        val targetIndex = adjacentVisibleChangeIndex(next) ?: return false
         return service.navigateToChange(targetIndex)
+    }
+
+    private fun adjacentVisibleChangeIndex(next: Boolean): Int? {
+        val visible = visibleChangeIndices()
+        if (visible.isEmpty()) return null
+        val currentPosition = visible.indexOf(selectedChangeIndex)
+        if (currentPosition < 0) {
+            return if (next) visible.firstOrNull { it > selectedChangeIndex } ?: visible.firstOrNull()
+            else visible.lastOrNull { it < selectedChangeIndex } ?: visible.lastOrNull()
+        }
+        val targetPosition = if (next) currentPosition + 1 else currentPosition - 1
+        return visible.getOrNull(targetPosition)
+    }
+
+    private fun visibleChangeIndices(): List<Int> {
+        val activeSession = session ?: return emptyList()
+        val query = filterText.lowercase()
+        return activeSession.changes
+            .mapIndexed { index, change -> index to change }
+            .filter { (_, change) -> matchesVisibleChange(change, query) }
+            .sortedBy { (_, change) -> change.displayPath() }
+            .map { (index, _) -> index }
     }
 
     private fun navigateFromDiffCaret(editor: EditorEx?): Boolean {
@@ -1081,7 +1152,10 @@ class MrReviewFileEditor(
         }
     }
 
-    private fun matchesFilter(change: MrReviewChange, query: String): Boolean {
+    private fun matchesVisibleChange(change: MrReviewChange, query: String): Boolean =
+        fileScope.matches(change) && matchesSearch(change, query)
+
+    private fun matchesSearch(change: MrReviewChange, query: String): Boolean {
         if (query.isBlank()) return true
         val path = change.displayPath().lowercase()
         val name = path.substringAfterLast('/')
@@ -1149,6 +1223,18 @@ class MrReviewFileEditor(
     private fun passiveCommentAccent(): Color =
         if (isDarkTheme()) Color(0x7A8FA8) else Color(0x8EA9C1)
 
+    private fun scopeAccent(): Color =
+        if (isDarkTheme()) Color(0x4C8DFF) else Color(0x3574F0)
+
+    private fun scopeSelectedBackground(): Color =
+        mix(UIUtil.getPanelBackground(), scopeAccent(), if (isDarkTheme()) 0.22f else 0.12f)
+
+    private fun scopeSelectedForeground(): Color =
+        if (isDarkTheme()) Color(0xDCEBFF) else Color(0x174EA6)
+
+    private fun scopeSelectedBorder(): Color =
+        mix(UIUtil.getPanelBackground(), scopeAccent(), if (isDarkTheme()) 0.74f else 0.68f)
+
     private fun mix(base: Color, accent: Color, weight: Float): Color {
         val normalized = weight.coerceIn(0f, 1f)
         val inverse = 1f - normalized
@@ -1168,6 +1254,48 @@ class MrReviewFileEditor(
             return if (normalized <= 0.03928) normalized / 12.92 else Math.pow((normalized + 0.055) / 1.055, 2.4)
         }
         return 0.2126 * channel(color.red) + 0.7152 * channel(color.green) + 0.0722 * channel(color.blue)
+    }
+
+    private enum class FileScope(val id: String, val label: String) {
+        ALL("all", "All"),
+        CODE("code", "Code"),
+        TEST("test", "Test"),
+        DOCS("docs", "Docs");
+
+        fun matches(change: MrReviewChange): Boolean {
+            val path = (change.newPath ?: change.oldPath ?: "unknown").lowercase()
+            return when (this) {
+                ALL -> true
+                CODE -> !isTestPath(path) && !isDocsPath(path)
+                TEST -> isTestPath(path)
+                DOCS -> isDocsPath(path)
+            }
+        }
+
+        companion object {
+            fun fromId(id: String?): FileScope =
+                entries.firstOrNull { it.id == id } ?: ALL
+
+            private fun isTestPath(path: String): Boolean {
+                val name = path.substringAfterLast('/')
+                val segments = path.split('/')
+                return name.endsWith("_test.go") ||
+                    ".test." in name ||
+                    ".spec." in name ||
+                    segments.any { it == "test" || it == "tests" || it == "__tests__" }
+            }
+
+            private fun isDocsPath(path: String): Boolean {
+                val name = path.substringAfterLast('/')
+                return path == "docs" ||
+                    path.startsWith("docs/") ||
+                    "/docs/" in path ||
+                    name.endsWith(".md") ||
+                    name.endsWith(".mdx") ||
+                    name.endsWith(".rst") ||
+                    name.endsWith(".txt")
+            }
+        }
     }
 
     private sealed interface TreeEntry {
