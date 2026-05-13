@@ -73,6 +73,7 @@ import com.intellij.util.ui.UIUtil
 import java.awt.BorderLayout
 import java.awt.Color
 import java.awt.Component
+import java.awt.Dimension
 import java.awt.FlowLayout
 import java.awt.KeyboardFocusManager
 import java.awt.KeyEventDispatcher
@@ -371,8 +372,13 @@ class MrReviewFileEditor(
             FileScope.entries.forEach { scope ->
                 val button = JButton(scope.label).apply {
                     isFocusable = false
-                    margin = JBUI.insets(0, 3)
+                    margin = JBUI.insets(0, 0)
                     font = UIUtil.getLabelFont().deriveFont(UIUtil.getLabelFont().size2D - 1f)
+                    val textWidth = getFontMetrics(font).stringWidth(scope.label)
+                    val size = Dimension(textWidth + JBUI.scale(18), JBUI.scale(32))
+                    minimumSize = size
+                    preferredSize = size
+                    maximumSize = size
                     addActionListener {
                         if (fileScope != scope) {
                             fileScope = scope
@@ -511,7 +517,7 @@ class MrReviewFileEditor(
             button.foreground = if (selected) scopeSelectedForeground() else UIUtil.getLabelForeground()
             button.border = BorderFactory.createCompoundBorder(
                 JBUI.Borders.customLine(if (selected) scopeSelectedBorder() else JBUI.CurrentTheme.CustomFrameDecorations.separatorForeground()),
-                JBUI.Borders.empty(1, 3)
+                JBUI.Borders.empty(1, 0)
             )
         }
     }
@@ -1260,14 +1266,16 @@ class MrReviewFileEditor(
         ALL("all", "All"),
         CODE("code", "Code"),
         TEST("test", "Test"),
+        CONF("conf", "Conf"),
         DOCS("docs", "Docs");
 
         fun matches(change: MrReviewChange): Boolean {
             val path = (change.newPath ?: change.oldPath ?: "unknown").lowercase()
             return when (this) {
                 ALL -> true
-                CODE -> !isTestPath(path) && !isDocsPath(path)
+                CODE -> !isTestPath(path) && !isConfPath(path) && !isDocsPath(path)
                 TEST -> isTestPath(path)
+                CONF -> isConfPath(path)
                 DOCS -> isDocsPath(path)
             }
         }
@@ -1294,6 +1302,37 @@ class MrReviewFileEditor(
                     name.endsWith(".mdx") ||
                     name.endsWith(".rst") ||
                     name.endsWith(".txt")
+            }
+
+            private fun isConfPath(path: String): Boolean {
+                val name = path.substringAfterLast('/')
+                val configNames = setOf(
+                    ".editorconfig",
+                    ".env",
+                    ".env.example",
+                    ".env.local",
+                    ".gitignore",
+                    ".golangci.yml",
+                    ".golangci.yaml",
+                    "dockerfile",
+                    "go.mod",
+                    "go.sum",
+                    "makefile",
+                    "package-lock.json",
+                    "package.json",
+                    "pnpm-lock.yaml",
+                    "yarn.lock"
+                )
+                return name in configNames ||
+                    name.endsWith(".conf") ||
+                    name.endsWith(".env") ||
+                    name.endsWith(".ini") ||
+                    name.endsWith(".json") ||
+                    name.endsWith(".properties") ||
+                    name.endsWith(".toml") ||
+                    name.endsWith(".yaml") ||
+                    name.endsWith(".yml") ||
+                    name.endsWith(".lock")
             }
         }
     }

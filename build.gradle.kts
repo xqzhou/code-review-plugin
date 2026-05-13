@@ -2,8 +2,8 @@ import org.jetbrains.intellij.platform.gradle.TestFrameworkType
 
 plugins {
     id("java")
-    id("org.jetbrains.kotlin.jvm") version "2.0.21"
-    id("org.jetbrains.intellij.platform") version "2.1.0"
+    id("org.jetbrains.kotlin.jvm") version "2.2.0"
+    id("org.jetbrains.intellij.platform") version "2.14.0"
 }
 
 group = providers.gradleProperty("pluginGroup").get()
@@ -23,12 +23,11 @@ dependencies {
         if (localPlatformPath.isPresent) {
             local(localPlatformPath)
         } else {
-            goland(providers.gradleProperty("platformVersion"), false)
+            goland(providers.gradleProperty("platformVersion"))
         }
         bundledPlugin("org.jetbrains.plugins.go")
         bundledPlugin("Git4Idea")
         bundledModule("intellij.platform.vcs.dvcs.impl")
-        instrumentationTools()
         testFramework(TestFrameworkType.Platform)
     }
     implementation("com.google.code.gson:gson:2.11.0")
@@ -56,6 +55,6 @@ intellijPlatform {
 
 tasks {
     wrapper {
-        gradleVersion = "8.10.2"
+        gradleVersion = "9.0.0"
     }
 }
