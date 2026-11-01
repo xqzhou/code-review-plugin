@@ -8,10 +8,11 @@ let an external skill pick them up to push to a Merge Request.
 
 ```bash
 JAVA_HOME=<JDK 21 path> ./gradlew buildPlugin
-# Output: build/distributions/code-review-plugin-0.1.0.zip
+# Output: build/distributions/code-review-plugin-<version>.zip
 ```
 
 In GoLand: `Settings → Plugins → ⚙ → Install Plugin from Disk…` and pick the zip.
+This release supports GoLand IDE builds 253 through 262, including GoLand 2026.2.
 
 Run sandbox IDE with the plugin loaded:
 
@@ -60,9 +61,8 @@ JAVA_HOME=<JDK 21 path> ./gradlew runIde
 ## Team Distribution
 
 - Build a versioned zip with `./gradlew buildPlugin`.
-- Install or upgrade from
-  [build/distributions/code-review-plugin-0.1.0.zip](build/distributions/code-review-plugin-0.1.0.zip)
-  via `Settings -> Plugins -> gear icon -> Install Plugin from Disk...`.
+- Install or upgrade from the zip in `build/distributions/` via
+  `Settings -> Plugins -> gear icon -> Install Plugin from Disk...`.
 - Existing branch-scoped comment files under `.code-review/` are preserved
   across plugin upgrades.
 

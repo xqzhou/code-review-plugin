@@ -4,14 +4,14 @@ This file provides guidance to Codex (Codex.ai/code) when working with code in t
 
 ## Build & Run
 
-Requires JDK 21. Kotlin 2.0.21, IntelliJ Platform Gradle Plugin 2.1.0, Gradle 8.10.2.
+Requires JDK 21. Kotlin 2.2.0, IntelliJ Platform Gradle Plugin 2.14.0, Gradle 9.0.0.
 
 ```bash
 JAVA_HOME=<JDK 21 path> ./gradlew buildPlugin   # produces build/distributions/code-review-plugin-<version>.zip
 JAVA_HOME=<JDK 21 path> ./gradlew runIde        # launches a sandbox GoLand with the plugin loaded
 ```
 
-Plugin targets GoLand 2024.2.5 (`sinceBuild=242`, `untilBuild=253.*`). Version and name come from `gradle.properties` (`pluginVersion`, `pluginName`).
+Plugin builds against GoLand 2025.3.3 and supports IDE builds 253 through 262 (`sinceBuild=253`, `untilBuild=262.*`). Version and name come from `gradle.properties` (`pluginVersion`, `pluginName`). Run `./gradlew verifyPlugin -PverificationIdePath=<path to newer GoLand.app/Contents>` to check the baseline and a local newer IDE.
 
 ## Architecture
 

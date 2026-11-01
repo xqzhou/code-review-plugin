@@ -45,12 +45,19 @@ intellijPlatform {
 
         ideaVersion {
             sinceBuild = "253"
-            untilBuild = "253.*"
+            untilBuild = "262.*"
         }
     }
 
     publishing {
         // token = providers.environmentVariable("PUBLISH_TOKEN")
+    }
+
+    pluginVerification {
+        ides {
+            current()
+            providers.gradleProperty("verificationIdePath").orNull?.let { local(file(it)) }
+        }
     }
 }
 
